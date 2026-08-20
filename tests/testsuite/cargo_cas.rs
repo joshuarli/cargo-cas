@@ -217,6 +217,36 @@ fn start_gated_check_in_dir(
         .unwrap()
 }
 
+fn start_check_paused_before_cas_publish(
+    project: &Project,
+    target_dir: &Path,
+    pause_signal: &Path,
+) -> Child {
+    let mut cargo = project.cargo("check -Zcargo-cas -vv");
+    cargo
+        .arg("--target-dir")
+        .arg(target_dir)
+        .env("CARGO_CAS_TEST_PAUSE_BEFORE_PUBLISH", pause_signal)
+        .masquerade_as_nightly_cargo(&["cargo-cas"]);
+    cargo
+        .build_command()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+fn wait_for_path(path: &Path) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if path.exists() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
+
 fn wait_for_log_line(log: &Path, line: &str) -> bool {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
@@ -773,6 +803,92 @@ edition = "2024"
 }
 
 #[cargo_test]
+fn killed_cargo_before_atomic_publish_leaves_no_cache_hit() {
+    const PACKAGE: &str = "cas-gate-four-killed-writer";
+    const CRATE: &str = "cas_gate_four_killed_writer";
+
+    registry::init();
+    Package::new(PACKAGE, "1.0.0")
+        .edition("2024")
+        .file("src/lib.rs", "pub fn answer() -> u32 { 42 }\n")
+        .publish();
+
+    let manifest = format!(
+        r#"[package]
+name = "crash-before-publish-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+{PACKAGE} = "1.0.0"
+"#,
+    );
+    let killed_writer = project_in("cas-gate-four-killed-writer")
+        .file("Cargo.toml", &manifest)
+        .file(
+            "src/main.rs",
+            "fn main() { cas_gate_four_killed_writer::answer(); }\n",
+        )
+        .build();
+    let recovery = project_in("cas-gate-four-killed-writer-recovery")
+        .file("Cargo.toml", &manifest)
+        .file(
+            "src/main.rs",
+            "fn main() { cas_gate_four_killed_writer::answer(); }\n",
+        )
+        .build();
+    let hit = project_in("cas-gate-four-killed-writer-hit")
+        .file("Cargo.toml", &manifest)
+        .file(
+            "src/main.rs",
+            "fn main() { cas_gate_four_killed_writer::answer(); }\n",
+        )
+        .build();
+
+    let pause_signal = paths::root().join("cas-gate-four-before-publish");
+    let mut child = start_check_paused_before_cas_publish(
+        &killed_writer,
+        &paths::root().join("cas-gate-four-killed-writer-target"),
+        &pause_signal,
+    );
+    assert!(
+        wait_for_path(&pause_signal),
+        "the writer did not reach the pre-publish crash boundary"
+    );
+
+    // `kill` is SIGKILL on macOS. At this point `tmp/<unique-writer>` is
+    // complete but has not been renamed into the ActionKey directory.
+    child.kill().unwrap();
+    let killed = wait_for_child(child);
+    assert!(
+        !killed.status.success(),
+        "a killed Cargo process unexpectedly exited successfully: {killed:?}"
+    );
+    fs::remove_file(&pause_signal).unwrap();
+
+    let recovery_output = run_check(
+        &recovery,
+        &paths::root().join("cas-gate-four-killed-writer-recovery-target"),
+        "",
+    );
+    assert!(
+        crate_was_compiled(&recovery_output, CRATE),
+        "an unpublished staged entry must be ignored and rebuilt:\n{}",
+        String::from_utf8_lossy(&recovery_output.stderr)
+    );
+    let hit_output = run_check(
+        &hit,
+        &paths::root().join("cas-gate-four-killed-writer-hit-target"),
+        "",
+    );
+    assert!(
+        !crate_was_compiled(&hit_output, CRATE),
+        "the successful recovery must publish a reusable entry:\n{}",
+        String::from_utf8_lossy(&hit_output.stderr)
+    );
+}
+
+#[cargo_test]
 fn cache_ignores_partial_entries_and_repairs_corrupt_writer_state() {
     const PACKAGE: &str = "cas-gate-four-dep";
     const CRATE: &str = "cas_gate_four_dep";
@@ -932,6 +1048,149 @@ edition = "2024"
         !crate_was_compiled(&recovered_output, CRATE),
         "a repaired partial entry should be reusable:\n{}",
         String::from_utf8_lossy(&recovered_output.stderr)
+    );
+
+    // Each manifest field is validation data, not merely descriptive state.
+    // Removing or truncating an artifact, lying about its size/digest, or
+    // replacing its relative name with a traversal path must all rebuild.
+    let artifact = entry.join("artifacts/0");
+    fs::remove_file(&artifact).unwrap();
+    let missing_output = run_check(
+        &partial,
+        &paths::root().join("cas-gate-four-missing-artifact-target"),
+        "",
+    );
+    assert!(crate_was_compiled(&missing_output, CRATE));
+    let missing_repaired_output = run_check(
+        &recovered,
+        &paths::root().join("cas-gate-four-missing-artifact-repaired-target"),
+        "",
+    );
+    assert!(!crate_was_compiled(&missing_repaired_output, CRATE));
+
+    fs::write(&artifact, b"truncated").unwrap();
+    let truncated_output = run_check(
+        &partial,
+        &paths::root().join("cas-gate-four-truncated-artifact-target"),
+        "",
+    );
+    assert!(crate_was_compiled(&truncated_output, CRATE));
+    let truncated_repaired_output = run_check(
+        &recovered,
+        &paths::root().join("cas-gate-four-truncated-artifact-repaired-target"),
+        "",
+    );
+    assert!(!crate_was_compiled(&truncated_repaired_output, CRATE));
+
+    let mut altered_size: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&cache_manifest).unwrap()).unwrap();
+    let size = altered_size["artifacts"][0]["size"].as_u64().unwrap();
+    altered_size["artifacts"][0]["size"] = serde_json::Value::from(size + 1);
+    fs::write(&cache_manifest, serde_json::to_vec(&altered_size).unwrap()).unwrap();
+    let size_output = run_check(
+        &partial,
+        &paths::root().join("cas-gate-four-altered-size-target"),
+        "",
+    );
+    assert!(crate_was_compiled(&size_output, CRATE));
+    let size_repaired_output = run_check(
+        &recovered,
+        &paths::root().join("cas-gate-four-altered-size-repaired-target"),
+        "",
+    );
+    assert!(!crate_was_compiled(&size_repaired_output, CRATE));
+
+    let mut altered_digest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&cache_manifest).unwrap()).unwrap();
+    altered_digest["artifacts"][0]["digest"] = serde_json::Value::String("00".to_owned());
+    fs::write(
+        &cache_manifest,
+        serde_json::to_vec(&altered_digest).unwrap(),
+    )
+    .unwrap();
+    let digest_output = run_check(
+        &partial,
+        &paths::root().join("cas-gate-four-altered-digest-target"),
+        "",
+    );
+    assert!(crate_was_compiled(&digest_output, CRATE));
+    let digest_repaired_output = run_check(
+        &recovered,
+        &paths::root().join("cas-gate-four-altered-digest-repaired-target"),
+        "",
+    );
+    assert!(!crate_was_compiled(&digest_repaired_output, CRATE));
+
+    let outside_artifact = paths::root().join("outside-cargo-cas-artifact");
+    fs::write(&outside_artifact, b"outside artifact remains untouched").unwrap();
+    let mut traversal_manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&cache_manifest).unwrap()).unwrap();
+    traversal_manifest["artifacts"][0]["file"] = serde_json::Value::String("../outside".to_owned());
+    fs::write(
+        &cache_manifest,
+        serde_json::to_vec(&traversal_manifest).unwrap(),
+    )
+    .unwrap();
+    let traversal_output = run_check(
+        &partial,
+        &paths::root().join("cas-gate-four-path-traversal-target"),
+        "",
+    );
+    assert!(crate_was_compiled(&traversal_output, CRATE));
+    assert_eq!(
+        fs::read(&outside_artifact).unwrap(),
+        b"outside artifact remains untouched"
+    );
+    let traversal_repaired_output = run_check(
+        &recovered,
+        &paths::root().join("cas-gate-four-path-traversal-repaired-target"),
+        "",
+    );
+    assert!(!crate_was_compiled(&traversal_repaired_output, CRATE));
+
+    fs::remove_file(&artifact).unwrap();
+    symlink(&outside_artifact, &artifact).unwrap();
+    let artifact_symlink_output = run_check(
+        &partial,
+        &paths::root().join("cas-gate-four-artifact-symlink-target"),
+        "",
+    );
+    assert!(crate_was_compiled(&artifact_symlink_output, CRATE));
+    assert_eq!(
+        fs::read(&outside_artifact).unwrap(),
+        b"outside artifact remains untouched"
+    );
+    let artifact_symlink_repaired_output = run_check(
+        &recovered,
+        &paths::root().join("cas-gate-four-artifact-symlink-repaired-target"),
+        "",
+    );
+    assert!(!crate_was_compiled(
+        &artifact_symlink_repaired_output,
+        CRATE
+    ));
+
+    // Last-use tracking is mutable, but it must not be an escaping write
+    // primitive. A bad access symlink can lose usage accounting, never a cache
+    // hit or bytes outside the cache root.
+    let access = cache.join("access").join(entry.file_name().unwrap());
+    let outside_access = paths::root().join("outside-cargo-cas-access");
+    fs::write(&outside_access, b"outside access remains untouched").unwrap();
+    fs::remove_file(&access).unwrap();
+    symlink(&outside_access, &access).unwrap();
+    let access_symlink_output = run_check(
+        &recovered,
+        &paths::root().join("cas-gate-four-access-symlink-target"),
+        "",
+    );
+    assert!(
+        !crate_was_compiled(&access_symlink_output, CRATE),
+        "last-use tracking failure must not discard a valid cache hit:\n{}",
+        String::from_utf8_lossy(&access_symlink_output.stderr)
+    );
+    assert_eq!(
+        fs::read(&outside_access).unwrap(),
+        b"outside access remains untouched"
     );
 }
 

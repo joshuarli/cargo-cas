@@ -510,6 +510,8 @@ impl CachePublication {
             return Err(io::Error::other("staged cargo-cas entry failed validation").into());
         }
 
+        pause_before_publish_for_test();
+
         // `tmp` and the final entry are both below the same cache root, so rename
         // makes a completed entry visible atomically.  If another writer won the
         // race, its immutable entry is equally valid and ours is discarded.
@@ -523,6 +525,25 @@ impl CachePublication {
         }
         mark_used(&self.cache, self.key.as_str());
         Ok(())
+    }
+}
+
+/// Provides an integration-test-only process boundary immediately before the
+/// atomic publish. The variable is intentionally undocumented and requires a
+/// path controlled by the test harness; normal Cargo processes never enter
+/// this branch. Keeping the boundary here lets the crash test exercise the
+/// actual staged-entry protocol instead of approximating it with hand-written
+/// cache files.
+fn pause_before_publish_for_test() {
+    let Some(signal_path) = std::env::var_os("CARGO_CAS_TEST_PAUSE_BEFORE_PUBLISH") else {
+        return;
+    };
+    let signal_path = PathBuf::from(signal_path);
+    if fs::write(&signal_path, std::process::id().to_string()).is_err() {
+        return;
+    }
+    while signal_path.exists() {
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -962,7 +983,20 @@ fn mark_used(cache: &Path, key: &str) {
     let result = (|| -> io::Result<()> {
         let parent = access.parent().expect("cargo-cas access path has parent");
         fs::create_dir_all(parent)?;
-        let file = OpenOptions::new().create(true).append(true).open(access)?;
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = options.open(access)?;
+        if !file.metadata()?.file_type().is_file() {
+            return Err(io::Error::other(
+                "cargo-cas access entry is not a regular file",
+            ));
+        }
         file.set_times(fs::FileTimes::new().set_modified(SystemTime::now()))
     })();
     if let Err(error) = result {
