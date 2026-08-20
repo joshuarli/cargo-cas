@@ -42,7 +42,7 @@ cat >"$rustc_proxy" <<'EOF'
 #!/bin/sh
 previous=''
 for argument in "$@"; do
-    if [ "$previous" = '--crate-name' ] && [ "$argument" = 'cas_demo_dep' ]; then
+    if [ "$previous" = '--crate-name' ]; then
         printf '%s\n' "$argument" >>"$CAS_DEMO_RUSTC_LOG"
         break
     fi
@@ -116,6 +116,18 @@ count_dependency_rustc() {
     grep -c '^cas_demo_dep$' "$rustc_log" || true
 }
 
+count_total_rustc() {
+    if [ ! -f "$rustc_log" ]; then
+        printf '0'
+        return
+    fi
+    wc -l <"$rustc_log" | tr -d ' '
+}
+
+directory_bytes() {
+    du -sk "$1" | awk '{print $1 * 1024}'
+}
+
 assert_equal() {
     expected=$1
     actual=$2
@@ -178,14 +190,23 @@ done
 
 worktree_rustc=$(count_dependency_rustc)
 assert_equal 3 "$worktree_rustc" 'eight concurrent worktrees compile one new action once'
-avoided_invocations=$((1 + 1 + 7))
+worktree_count=8
+requested_dependency_actions=$((4 + worktree_count))
+avoided_invocations=$((requested_dependency_actions - worktree_rustc))
+total_rustc=$(count_total_rustc)
 
 cache_root="$CARGO_HOME/cache/cargo-cas-v1"
 cache_entries=$(find "$cache_root" -mindepth 1 -maxdepth 1 -type d -print \
     | awk -F/ '$NF ~ /^[0-9a-f]{64}$/ { count += 1 } END { print count + 0 }')
-cache_bytes=$(du -sk "$cache_root" | awk '{print $1 * 1024}')
+cache_bytes=$(directory_bytes "$cache_root")
+workspace_bytes=0
+for target_dir in "$work_root"/target-* "$work_root"/worktree-target-*; do
+    [ -d "$target_dir" ] || continue
+    workspace_bytes=$((workspace_bytes + $(directory_bytes "$target_dir")))
+done
 cache_hits=$(grep -h 'cargo-cas hit' "$work_root"/*.log 2>/dev/null | wc -l | tr -d ' ')
 cache_misses=$(grep -h 'cargo-cas miss' "$work_root"/*.log 2>/dev/null | wc -l | tr -d ' ')
+cache_skips=$(grep -h 'cargo-cas skip' "$work_root"/*.log 2>/dev/null | wc -l | tr -d ' ')
 
 cat <<EOF
 cargo-cas demo complete
@@ -194,8 +215,11 @@ cargo-cas demo complete
   avoided invocations:          $avoided_invocations
   cache hits:                   $cache_hits
   cache misses:                 $cache_misses
+  cache skips:                  $cache_skips
   cache entries:                $cache_entries
   cache bytes:                  $cache_bytes
-  concurrent worktrees:         8
+  workspace build bytes:        $workspace_bytes
+  total rustc invocations:      $total_rustc
+  concurrent worktrees:         $worktree_count
   shared concurrent rustc:      $((worktree_rustc - feature_rustc))
 EOF
