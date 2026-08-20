@@ -11,10 +11,17 @@ use std::path::{Path, PathBuf};
 
 mod cli;
 mod commands;
+#[cfg(feature = "cargo-cas-default")]
+mod fast_path;
 
 use crate::command_prelude::*;
 
 fn main() {
+    #[cfg(feature = "cargo-cas-default")]
+    if fast_path::try_noop() {
+        return;
+    }
+
     let _guard = setup_logger();
 
     let mut gctx = match GlobalContext::default() {
@@ -52,6 +59,11 @@ fn main() {
         let _token = cargo::util::job::setup();
         cli::main(&mut gctx)
     };
+
+    #[cfg(feature = "cargo-cas-default")]
+    if result.is_ok() {
+        fast_path::record_success();
+    }
 
     match result {
         Err(e) => cargo::exit_with_error(e, &mut *gctx.shell()),

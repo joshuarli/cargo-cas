@@ -105,6 +105,26 @@ The cache never replaces Cargo's `Unit`, `UnitGraph`, `Fingerprint`,
 `JobQueue`, or artifact-uplift contracts. A hit is a normal dirty Cargo job
 whose work happens to materialize already-compiled outputs.
 
+### Validated no-op receipt
+
+The installed `cargo-cas` build also has a deliberately narrow startup fast
+path for an unchanged, argument-only `build` or `check` in a non-workspace
+package. After a successful ordinary invocation, it records a versioned receipt
+under `target/.cargo-cas/noop-v1.json`. The receipt binds the canonical project
+and target paths, the exact command shape, the environment context, every
+project/configuration input, and every target-directory file identity. Receipts
+are not published when Cargo has a cached compiler or build-script diagnostic,
+so a hit does not hide warnings that Cargo would otherwise replay. On the next
+invocation the receipt is validated while holding Cargo's `target/debug/.cargo-lock`;
+missing, malformed, changed, or ambiguous state falls through to the ordinary
+Cargo path. The receipt is an optimization only: it does not replace Cargo's
+fingerprints, resolution, or diagnostics for unsupported command shapes, and it
+is enabled only by the locally installed `cargo-cas-default` feature. Set
+`CARGO_CAS_DISABLE_FAST_NOOP=1` to force the ordinary path while diagnosing a
+project. `scripts/benchmark-noop.sh` compares that forced ordinary path with
+receipt hits on a selected package. Platforms without the file-lock primitive
+used by Cargo take the ordinary path.
+
 ## Cargo integration
 
 The relevant implementation is `src/compiler/cas.rs`, called from
