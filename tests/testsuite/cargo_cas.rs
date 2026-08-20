@@ -1814,6 +1814,36 @@ edition = "2024"
         "every distinct worktree root must compile independently"
     );
 
+    // Cache readers use separate target directories, so all eight roots still
+    // need normal local scheduling work.  None may invoke rustc for the
+    // already-published shared dependency, even while the readers overlap.
+    let reader_outputs = worktrees
+        .iter()
+        .enumerate()
+        .map(|(index, worktree)| {
+            start_gated_check_in_dir(
+                &driver,
+                worktree,
+                &paths::root().join(format!("cas-gate-six-reader-target-{index}")),
+                &rustc,
+                CRATE,
+                &log,
+                &release,
+            )
+        })
+        .map(wait_for_child)
+        .collect::<Vec<_>>();
+    assert!(
+        reader_outputs.iter().all(|output| output.status.success()),
+        "one of the concurrent cache-reader builds failed: {reader_outputs:#?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&log).unwrap().lines().count(),
+        1,
+        "concurrent cache readers must not rebuild the shared action: {}",
+        fs::read_to_string(&log).unwrap_or_default()
+    );
+
     let cache_root = paths::cargo_home().join("cache/cargo-cas-v1");
     let cache_entries = fs::read_dir(&cache_root)
         .unwrap()
