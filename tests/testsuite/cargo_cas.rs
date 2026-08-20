@@ -732,6 +732,29 @@ edition = "2024"
         "a cache hit must leave Cargo's ordinary final binary intact"
     );
 
+    // A dependency hit must also preserve Cargo's ordinary artifact export
+    // path. The root binary is always built and exported locally; only the
+    // immutable dependency artifacts are restored from cargo-cas.
+    let artifact_target = paths::root().join("cas-build-artifact-dir-target");
+    let artifact_dir = paths::root().join("cas-build-artifact-dir-export");
+    let mut artifact_command = second.cargo("build -Zcargo-cas -Zunstable-options -vv");
+    artifact_command
+        .arg("--target-dir")
+        .arg(&artifact_target)
+        .arg("--artifact-dir")
+        .arg(&artifact_dir)
+        .masquerade_as_nightly_cargo(&["cargo-cas", "unstable-options"]);
+    let artifact_output = artifact_command.run();
+    assert!(
+        !crate_was_compiled(&artifact_output, BUILD_CRATE),
+        "an artifact-dir build should still restore the matching dependency:\n{}",
+        String::from_utf8_lossy(&artifact_output.stderr)
+    );
+    assert!(
+        artifact_dir.join("cas-build-second").is_file(),
+        "the root binary must be exported through Cargo's normal artifact-dir path"
+    );
+
     // The materialized artifacts and normal fingerprint state are also usable
     // by an invocation that does not opt into cargo-cas.  This guards the
     // scheduler boundary: a cache hit is normal local Cargo state, not a
