@@ -279,7 +279,11 @@ impl LinkArgTarget {
 
 /// Prepares a `Work` that executes the target as a custom build script.
 #[tracing::instrument(skip_all)]
-pub fn prepare(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResult<Job> {
+pub fn prepare(
+    build_runner: &mut BuildRunner<'_, '_>,
+    unit: &Unit,
+    cas_replay: Option<crate::compiler::cas::BuildScriptReplay>,
+) -> CargoResult<Job> {
     let metadata = build_runner.get_run_build_script_metadata(unit);
     if build_runner
         .build_script_outputs
@@ -290,13 +294,13 @@ pub fn prepare(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResu
         // The output is already set, thus the build script is overridden.
         fingerprint::prepare_target(build_runner, unit, false)
     } else {
-        build_work(build_runner, unit)
+        build_work(build_runner, unit, cas_replay)
     }
 }
 
 /// Emits the output of a build script as a [`machine_message::BuildScript`]
 /// JSON string to standard output.
-fn emit_build_output(
+pub(crate) fn emit_build_output(
     state: &JobState<'_, '_>,
     output: &BuildOutput,
     out_dir: &Path,
@@ -329,7 +333,11 @@ fn emit_build_output(
 /// * Create the output dir (`OUT_DIR`) for the build script output.
 /// * Determine if the build script needs a re-run.
 /// * Run the build script and store its output.
-fn build_work(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResult<Job> {
+fn build_work(
+    build_runner: &mut BuildRunner<'_, '_>,
+    unit: &Unit,
+    cas_replay: Option<crate::compiler::cas::BuildScriptReplay>,
+) -> CargoResult<Job> {
     assert!(unit.mode.is_run_custom_build());
     let bcx = &build_runner.bcx;
     let dependencies = build_runner.unit_deps(unit);
@@ -739,7 +747,20 @@ fn build_work(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResul
 
     let mut job = fingerprint::prepare_target(build_runner, unit, false)?;
     if job.freshness().is_dirty() {
-        job.before(dirty);
+        if let Some(replay) = cas_replay {
+            job.before(Work::new(move |state| {
+                let replay = replay.work();
+                match replay.call(state) {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        tracing::warn!(error = ?error, "cargo-cas build-script replay failed; running the script normally");
+                        dirty.call(state)
+                    }
+                }
+            }));
+        } else {
+            job.before(dirty);
+        }
     } else {
         job.before(fresh);
     }
@@ -1411,7 +1432,7 @@ fn prev_build_output(
 
 impl BuildScriptOutputs {
     /// Inserts a new entry into the map.
-    fn insert(&mut self, pkg_id: PackageId, metadata: UnitHash, parsed_output: BuildOutput) {
+    pub(crate) fn insert(&mut self, pkg_id: PackageId, metadata: UnitHash, parsed_output: BuildOutput) {
         match self.outputs.entry(metadata) {
             Entry::Vacant(entry) => {
                 entry.insert(parsed_output);

@@ -55,7 +55,7 @@ re-read the design discussion rather than infer behavior from this document.
 | Fine-grained locking | [#4282](https://github.com/rust-lang/cargo/issues/4282), [#16089](https://github.com/rust-lang/cargo/issues/16089), [#16155](https://github.com/rust-lang/cargo/pull/16155) | `abaa830fa` | Shared read lock for freshness, exclusive per-unit lock for a dirty build, then shared read lock after publication. The earlier experiment is superseded. |
 | Artifact/build lock split | [#16307](https://github.com/rust-lang/cargo/pull/16307), [#16708](https://github.com/rust-lang/cargo/pull/16708) | `2a1789fcc`, `6cea00ce0` | `artifact-dir` and `build-dir` have separate lock files; check builds do not need the artifact lock. |
 | Moving build state to Cargo home | [#16147](https://github.com/rust-lang/cargo/issues/16147) | Proposal/tracking discussion | A possible future location for shared build state; this experiment must not silently turn the normal workspace `build-dir` into a global mutable directory. |
-| Build-script final-artifact staging | [#13663](https://github.com/rust-lang/cargo/issues/13663) | Open design constraint | Build scripts produce arbitrary host-observed/generated state; they are not a safe V0 global-cache unit. |
+| Build-script final-artifact staging | [#13663](https://github.com/rust-lang/cargo/issues/13663) | Conservative replay boundary | Deterministic scripts may cache declared cfg/env/rerun output and regular files below `OUT_DIR`; native linking, external paths, build dependencies, and unsafe outputs fall back to Cargo. |
 | Global source-cache GC | [#12633](https://github.com/rust-lang/cargo/issues/12633) | Implemented in `9a1b0924c`/#12634 | `GlobalCacheTracker` tracks Cargo home source-cache use. This is not artifact GC. |
 | Build-artifact GC | [#13136](https://github.com/rust-lang/cargo/issues/13136) | Tracking issue | Build artifacts are not covered by the existing global-cache tracker; CAS GC is later work. |
 
@@ -357,7 +357,7 @@ paths and values can affect compiler behavior or output bytes:
 | Linker/toolchain config | `add_codegen_linker`, target data, `Rustc` process selection | Absolute linker/ar paths and wrapper behavior affect output; arbitrary external tool discovery is outside V0. |
 | Cargo/rustc flags | `extra_args_for`, unit flags, effective `RUSTFLAGS`/`RUSTDOCFLAGS`, `-Zbinary-dep-depinfo`, `-Zchecksum-freshness` | Flags are not all represented by one existing hash; include all semantically relevant effective arguments or make the unit ineligible. |
 | Incremental state | `add_codegen_incremental` (`-C incremental=<build-dir>/.../incremental`) | Mutable and workspace-local; never publish it as an immutable V0 artifact. |
-| Build-script outputs | `build_deps_args`, `add_custom_flags`, `add_native_deps` | `OUT_DIR`, cfg/env, `-L`, `-l`, linker args and generated files can observe arbitrary host state. Exclude build scripts and affected dependents in V0. |
+| Build-script outputs | `build_deps_args`, `add_custom_flags`, `add_native_deps` | `src/compiler/cas.rs` caches only declared cfg/env/rerun output and regular files below `OUT_DIR`; native/linker/search-path, external rerun, build-dependency, and malformed output remains a normal Cargo fallback. |
 | Generated/build environment | `CARGO_*`, package metadata env comments in dep-info, `CARGO_TARGET_TMPDIR`, SBOM/unremap paths | Some values are runtime-only or local bookkeeping; some change compiler input. The classifier must exclude uncertain cases rather than guess. |
 | Path remapping | `trim_paths_args`, `trim_paths_remap`, `__CARGO_RUSTC_BOOTSTRAP_WS_REMAP` | Remapping can make source/build/sysroot paths portable, but changes artifact content. Include effective remap semantics in the key; do not force trim-paths before Gate 1 proves the need. |
 
@@ -496,7 +496,7 @@ the resolver, unit graph, or job queue contracts.
 
 | Concern | Narrow insertion point | Required behavior/constraint |
 | --- | --- | --- |
-| Eligibility | `src/compiler/mod.rs::compile`, after the complete `Unit` and `BuildRunner::unit_deps` are known and before the dirty work is selected | Make a conservative closed-world decision. Start with immutable registry package, normal pure-Rust library, no build script/proc-macro/native/generated input, no incremental, no path/workspace source, no final/root target. Unknown means normal Cargo fallback. |
+| Eligibility | `src/compiler/mod.rs::compile`, after the complete `Unit` and `BuildRunner::unit_deps` are known and before the dirty work is selected | Make a conservative closed-world decision. Registry/git packages and same-checkout path packages may participate; deterministic build-script outputs are replayable only inside the explicit boundary in `src/compiler/cas.rs`. Unknown means normal Cargo fallback. |
 | Semantic key generation | A helper called from the same compile path, using `CompilationFiles::metadata`, effective profile/kind/mode/flags, source checksum, strict rustc/toolchain identity, and recursively computed dependency keys | Use a versioned canonical structure, not `Fingerprint::hash_u64`, `UnitHash`, `UnitIndex`, Rust's generic `Hash` serialization, or workspace-local paths. Include every effective compiler input that can affect bytes/ABI. Dependency keys form a DAG. |
 | Lookup | In `compile`, after `fingerprint::prepare_target` identifies a dirty eligible unit and before choosing `rustc(...)` | A local fresh unit still follows the ordinary fresh path. A global hit must be validated as a complete entry before scheduling its materialization work. A miss must select the unchanged rustc work. |
 | Publish | Chain a CAS publish `Work` after successful `rustc` work (which has translated dep-info and completed outputs) and before `link_targets`, or place the equivalent finalization at the end of the `rustc` work closure | Stage all artifacts and a validated manifest in a per-writer temporary directory; atomically rename/publish on the same filesystem. Never expose a partial entry as a hit. Coordinate same-key writers without serializing different keys. |
@@ -521,22 +521,26 @@ ActionKey schema:
 
 ```text
 eligible iff
-    source is an immutable registry package with a verified checksum
+    source is an immutable registry/git package with a verified identity,
+      or a local path with a complete same-checkout snapshot
     && unit is a normal pure-Rust library build
     && compile mode is Build or the explicitly supported Check form
-    && no build.rs / RunCustomBuild affects this package or its inputs
+    && every affecting RunCustomBuild has a closed, replayable output
     && no proc-macro unit or proc-macro execution affects this unit
     && no native-linking or generated external input is present
     && profile.incremental is false
-    && no path/workspace source, final/root artifact, bin, test, bench, example,
+    && no final/root artifact, bin, test, bench, example,
        rustdoc, or build-script output is being requested
     && all effective inputs can be represented without workspace-local paths
 ```
 
-In practice, a registry dependency with a transitive build script or proc
-macro should be excluded until the entire affected subgraph has a closed-world
-model. A cache miss is always safe normal Cargo behavior; a false hit is a
-correctness bug.
+Path sources are keyed by canonical checkout root and a BLAKE3 snapshot of all
+regular package files (excluding only VCS metadata and Cargo's `target`
+directory). This is deliberately same-checkout conservative: moving a checkout
+causes a miss until path remapping is proven safe. Build-script entries are
+separate from compiler artifacts and contain the raw parsed output, declared
+environment values, and validated `OUT_DIR` files. A cache miss is always safe
+normal Cargo behavior; a false hit is a correctness bug.
 
 For macOS-only work:
 
@@ -613,7 +617,7 @@ contains no absolute path or tracked environment. It then rebases naturally
 when Cargo parses it against the destination build root. It is transport for
 local freshness, never an ActionKey input or arbitrary workspace bookkeeping.
 
-## Cache storage V1 and manifest format V2
+## Cache storage V1 and manifest format V3
 
 The current experiment stores entries under
 `$CARGO_HOME/cache/cargo-cas-v1`. A manifest records its format version and
@@ -632,8 +636,10 @@ manifest schema bumps the manifest format (or, if the on-disk layout itself
 changes, creates a new cache-format directory) rather than interpreting an
 older entry permissively.
 
-The current manifest format is `2`. It invalidates format `1` entries because
-the older artifact set could not replay compiler diagnostics on a cache hit.
+The current manifest format is `3`. It invalidates format `2` entries because
+the newer key includes local path snapshots and deterministic build-script
+replay state. Build-script entries use the same action-key directory and a
+`build-script.json` manifest alongside their validated generated files.
 The cache root remains `cargo-cas-v1` because the manifest version already
 makes the change a complete, safe miss-and-rebuild boundary.
 

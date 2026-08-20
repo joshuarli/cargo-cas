@@ -174,6 +174,33 @@ fn cache_manifest() -> std::path::PathBuf {
         .expect("a successful eligible check publishes a cargo-cas manifest")
 }
 
+fn cache_manifest_for_crate(crate_name: &str) -> std::path::PathBuf {
+    let cache = paths::home().join(".cargo/cache/cargo-cas-v1");
+    fs::read_dir(&cache)
+        .unwrap()
+        .map(Result::unwrap)
+        .map(|entry| entry.path().join("manifest.json"))
+        .filter(|manifest| manifest.is_file())
+        .find(|manifest| {
+            serde_json::from_str::<serde_json::Value>(&fs::read_to_string(manifest).unwrap())
+                .ok()
+                .and_then(|json| json["identity"]["crate_name"].as_str().map(str::to_owned))
+                .is_some_and(|name| name == crate_name)
+        })
+        .unwrap_or_else(|| panic!("no cargo-cas manifest for crate {crate_name}"))
+}
+
+fn build_script_cache_manifest(package_fragment: &str) -> std::path::PathBuf {
+    let cache = paths::home().join(".cargo/cache/cargo-cas-v1");
+    fs::read_dir(&cache)
+        .unwrap()
+        .map(Result::unwrap)
+        .map(|entry| entry.path().join("build-script.json"))
+        .filter(|manifest| manifest.is_file())
+        .find(|manifest| fs::read_to_string(manifest).unwrap().contains(package_fragment))
+        .unwrap_or_else(|| panic!("no cargo-cas build-script manifest for {package_fragment}"))
+}
+
 fn gated_rustc(name: &str) -> std::path::PathBuf {
     let path = paths::root().join(name);
     fs::write(
@@ -440,7 +467,7 @@ pub fn answer() -> u32 { 41 }
     let manifest = cache_manifest();
     let manifest_json: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&manifest).unwrap()).unwrap();
-    assert_eq!(manifest_json["format_version"], 2);
+    assert_eq!(manifest_json["format_version"], 3);
     assert_eq!(manifest_json["identity"]["target_name"], REGISTRY_CRATE);
     assert_eq!(manifest_json["identity"]["compile_mode"], "check");
     assert!(manifest_json["identity"]["package_id"].is_string());
@@ -483,7 +510,7 @@ pub fn answer() -> u32 { 41 }
     );
     let rebuilt_manifest: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&manifest).unwrap()).unwrap();
-    assert_eq!(rebuilt_manifest["format_version"], 2);
+    assert_eq!(rebuilt_manifest["format_version"], 3);
 
     let exact_output = run_check(&exact, &paths::root().join("cas-exact-target"), "");
     assert!(
@@ -679,7 +706,7 @@ edition = "2024"
 }
 
 #[cargo_test]
-fn non_registry_dependencies_always_use_normal_rustc_work() {
+fn local_path_dependencies_use_normal_rustc_on_a_cold_build() {
     let project = project_in("cas-path-fallback")
         .file(
             "Cargo.toml",
@@ -707,7 +734,7 @@ edition = "2024"
     let output = run_check(&project, &paths::root().join("cas-path-target"), "");
     assert!(
         crate_was_compiled(&output, "local_dependency"),
-        "path sources are ineligible and must run normal rustc:\n{}",
+        "a cold path-source miss must run normal rustc:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
 }
@@ -722,12 +749,30 @@ fn build_script_and_proc_macro_dependency_subgraphs_use_normal_rustc() {
     const PROC_MACRO_CRATE: &str = "cas_proc_macro_dep";
     const PROC_MACRO_USER_PACKAGE: &str = "cas-proc-macro-user";
     const PROC_MACRO_USER_CRATE: &str = "cas_proc_macro_user";
+    const UNSAFE_BUILD_PACKAGE: &str = "cas-unsafe-build-dep";
+    const UNSAFE_BUILD_CRATE: &str = "cas_unsafe_build_dep";
 
     registry::init();
     Package::new(BUILD_SCRIPT_PACKAGE, "1.0.0")
         .edition("2024")
-        .file("build.rs", "fn main() {}\n")
-        .file("src/lib.rs", "pub fn answer() {}\n")
+        .file(
+            "build.rs",
+            r#"use std::fs;
+use std::path::PathBuf;
+
+fn main() {
+    let mut generated = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    generated.push("generated.rs");
+    fs::write(generated, "pub const GENERATED: u32 = 42;\n").unwrap();
+    println!("cargo::rustc-env=CAS_BUILD_SCRIPT_VALUE=42");
+    println!("cargo::rerun-if-changed=build.rs");
+}
+"#,
+        )
+        .file(
+            "src/lib.rs",
+            "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));\npub fn answer() -> u32 { GENERATED + env!(\"CAS_BUILD_SCRIPT_VALUE\").parse::<u32>().unwrap() }\n",
+        )
         .publish();
     Package::new(BUILD_SCRIPT_USER_PACKAGE, "1.0.0")
         .edition("2024")
@@ -758,6 +803,12 @@ pub fn noop(_input: TokenStream) -> TokenStream { TokenStream::new() }
             "use cas_proc_macro_dep::noop;\nnoop!();\npub fn answer() {}\n",
         )
         .publish();
+    Package::new(UNSAFE_BUILD_PACKAGE, "1.0.0")
+        .edition("2024")
+        .links("cas-unsafe-build")
+        .file("build.rs", "fn main() { println!(\"cargo::rustc-link-search=/tmp\"); }\n")
+        .file("src/lib.rs", "pub fn answer() {}\n")
+        .publish();
 
     let build_script_first =
         registry_dependency_project("cas-build-script-first", BUILD_SCRIPT_USER_PACKAGE);
@@ -767,6 +818,14 @@ pub fn noop(_input: TokenStream) -> TokenStream { TokenStream::new() }
         registry_dependency_project("cas-proc-macro-first", PROC_MACRO_USER_PACKAGE);
     let proc_macro_second =
         registry_dependency_project("cas-proc-macro-second", PROC_MACRO_USER_PACKAGE);
+    let unsafe_build_first = registry_dependency_project(
+        "cas-unsafe-build-first",
+        UNSAFE_BUILD_PACKAGE,
+    );
+    let unsafe_build_second = registry_dependency_project(
+        "cas-unsafe-build-second",
+        UNSAFE_BUILD_PACKAGE,
+    );
 
     let build_script_first_output = run_check(
         &build_script_first,
@@ -781,20 +840,28 @@ pub fn noop(_input: TokenStream) -> TokenStream { TokenStream::new() }
         &build_script_first_output,
         BUILD_SCRIPT_USER_CRATE
     ));
+    let build_script_manifest = build_script_cache_manifest(BUILD_SCRIPT_PACKAGE);
+    let build_script_manifest_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(build_script_manifest).unwrap()).unwrap();
+    assert_eq!(build_script_manifest_json["format_version"], 3);
+    assert_eq!(build_script_manifest_json["files"].as_array().unwrap().len(), 1);
+    assert!(build_script_manifest_json["output"]
+        .as_str()
+        .unwrap()
+        .contains("rustc-env=CAS_BUILD_SCRIPT_VALUE=42"));
     let build_script_second_output = run_check_with_cas_log(
         &build_script_second,
         &paths::root().join("cas-build-script-second-target"),
     );
     assert!(
-        crate_was_compiled(&build_script_second_output, BUILD_SCRIPT_CRATE)
-            && crate_was_compiled(&build_script_second_output, BUILD_SCRIPT_USER_CRATE),
-        "a build-script-affected registry package must remain a normal compile:\n{}",
+        !crate_was_compiled(&build_script_second_output, BUILD_SCRIPT_USER_CRATE),
+        "a deterministic build-script-affected library should restore from cargo-cas:\n{}",
         String::from_utf8_lossy(&build_script_second_output.stderr)
     );
     assert!(
         String::from_utf8_lossy(&build_script_second_output.stderr)
-            .contains("cargo-cas skip: build-script affected"),
-        "a transitive build-script exclusion must remain observable:\n{}",
+            .contains("cargo-cas hit"),
+        "a build-script-backed cache hit must remain observable:\n{}",
         String::from_utf8_lossy(&build_script_second_output.stderr)
     );
 
@@ -826,6 +893,28 @@ pub fn noop(_input: TokenStream) -> TokenStream { TokenStream::new() }
             .contains("cargo-cas skip: proc-macro affected"),
         "a transitive proc-macro exclusion must remain observable:\n{}",
         String::from_utf8_lossy(&proc_macro_second_output.stderr)
+    );
+
+    let unsafe_build_first_output = run_check(
+        &unsafe_build_first,
+        &paths::root().join("cas-unsafe-build-first-target"),
+        "",
+    );
+    assert!(crate_was_compiled(&unsafe_build_first_output, UNSAFE_BUILD_CRATE));
+    let unsafe_build_second_output = run_check_with_cas_log(
+        &unsafe_build_second,
+        &paths::root().join("cas-unsafe-build-second-target"),
+    );
+    assert!(
+        crate_was_compiled(&unsafe_build_second_output, UNSAFE_BUILD_CRATE),
+        "an unsafe/native build script must remain a normal compile:\n{}",
+        String::from_utf8_lossy(&unsafe_build_second_output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&unsafe_build_second_output.stderr)
+            .contains("cargo-cas skips non-replayable build-script output"),
+        "the unsafe build-script skip must be explicit:\n{}",
+        String::from_utf8_lossy(&unsafe_build_second_output.stderr)
     );
 }
 
@@ -935,20 +1024,45 @@ edition = "2024"
         String::from_utf8_lossy(&second_output.stderr)
     );
 
-    let skip_output = run_check_with_cas_log(
+    let path_first_output = run_check_with_cas_log(
         &path_source,
         &paths::root().join("cas-observability-path-target"),
     );
-    assert!(crate_was_compiled(&skip_output, "local_dependency"));
+    assert!(crate_was_compiled(&path_first_output, "local_dependency"));
     assert!(
-        String::from_utf8_lossy(&skip_output.stderr).contains("cargo-cas skip: path source"),
-        "an ineligible unit must report why it was skipped:\n{}",
-        String::from_utf8_lossy(&skip_output.stderr)
+        String::from_utf8_lossy(&path_first_output.stderr).contains("cargo-cas miss"),
+        "a local path unit must participate in the cache on a cold build:\n{}",
+        String::from_utf8_lossy(&path_first_output.stderr)
+    );
+    let path_second_output = run_check_with_cas_log(
+        &path_source,
+        &paths::root().join("cas-observability-path-second-target"),
     );
     assert!(
-        String::from_utf8_lossy(&skip_output.stderr).contains("skips={\"path source\":"),
-        "the summary should aggregate skip reasons:\n{}",
-        String::from_utf8_lossy(&skip_output.stderr)
+        !crate_was_compiled(&path_second_output, "local_dependency"),
+        "an unchanged local path unit should restore from cargo-cas:\n{}",
+        String::from_utf8_lossy(&path_second_output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&path_second_output.stderr).contains("cargo-cas hit"),
+        "a local path hit should be observable in the cache trace:\n{}",
+        String::from_utf8_lossy(&path_second_output.stderr)
+    );
+    fs::write(
+        path_source
+            .root()
+            .join("local-dependency/src/lib.rs"),
+        "pub fn answer() { let _ = 1u8; }\n",
+    )
+    .unwrap();
+    let path_changed_output = run_check_with_cas_log(
+        &path_source,
+        &paths::root().join("cas-observability-path-changed-target"),
+    );
+    assert!(
+        crate_was_compiled(&path_changed_output, "local_dependency"),
+        "a local path source mutation must invalidate its cache action:\n{}",
+        String::from_utf8_lossy(&path_changed_output.stderr)
     );
 }
 
@@ -1507,7 +1621,7 @@ edition = "2024"
         &release,
     );
     assert!(crate_was_compiled(&first_output, CRATE));
-    let cache_manifest_path = cache_manifest();
+    let cache_manifest_path = cache_manifest_for_crate(CRATE);
     let manifest_json: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&cache_manifest_path).unwrap()).unwrap();
     let linkable = manifest_json["artifacts"]
@@ -1547,7 +1661,8 @@ edition = "2024"
         String::from_utf8_lossy(&output.stderr)
             .lines()
             .any(|line| line.contains("rustc") && line.contains(&format!("--crate-name {CRATE}"))),
-        "the missing linkable artifact must trigger ordinary dependency rustc"
+        "the missing linkable artifact must trigger ordinary dependency rustc:\n{}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

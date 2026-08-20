@@ -19,16 +19,22 @@ use tracing::{debug, warn};
 
 use super::fingerprint;
 use super::job_queue::Work;
-use super::{BuildRunner, CompileMode, CrateType, FileFlavor, Lto, Unit};
+use super::{
+    BuildRunner, CompileMode, CrateType, FileFlavor, Lto, Unit,
+    custom_build::{BuildOutput, BuildScriptOutputs},
+};
 use crate::util::CargoResult;
+use crate::workspace::{PackageId, Target};
+use cargo_util_schemas::manifest::RustVersion;
 
-// Version 2 adds the optional diagnostic output-cache artifact. Entries from
-// the prior format cannot provide Cargo's normal replay behavior, so they
-// must be rebuilt rather than accepted as a partial hit.
-const CACHE_FORMAT_VERSION: u8 = 2;
+// Version 3 adds content-addressed local path source identity. Entries from
+// older formats cannot prove that a path dependency still has the same source
+// snapshot, so they must be rebuilt rather than accepted as a partial hit.
+const CACHE_FORMAT_VERSION: u8 = 3;
 const CACHE_DIRECTORY: &str = "cargo-cas-v1";
 const MANIFEST_FILE: &str = "manifest.json";
 const ARTIFACTS_DIRECTORY: &str = "artifacts";
+const BUILD_SCRIPT_MANIFEST_FILE: &str = "build-script.json";
 const LOCKS_DIRECTORY: &str = "locks";
 const ACCESS_DIRECTORY: &str = "access";
 
@@ -151,7 +157,359 @@ pub(crate) struct CachePublication {
     identity: ManifestIdentityV1,
     cache: PathBuf,
     artifacts: Vec<ArtifactPath>,
+    build_script_outputs: Option<(
+        Arc<Mutex<BuildScriptOutputs>>,
+        Vec<super::UnitHash>,
+    )>,
 }
+
+/// A cacheable, non-native build-script execution. The script binary itself
+/// still follows Cargo's ordinary build-script compilation path; this action
+/// stores only its declared textual output and files created beneath `OUT_DIR`.
+#[derive(Clone)]
+pub(crate) struct BuildScriptCache {
+    action: BuildScriptCacheAction,
+    replay: Option<BuildScriptReplay>,
+}
+
+#[derive(Clone)]
+struct BuildScriptCacheAction {
+    key: ActionKey,
+    cache: PathBuf,
+    identity: BuildScriptIdentity,
+    output_file: PathBuf,
+    stderr_file: PathBuf,
+    root_output_file: PathBuf,
+    script_out_dir: PathBuf,
+    build_script_outputs: Arc<Mutex<BuildScriptOutputs>>,
+    package_id: PackageId,
+    metadata: super::UnitHash,
+    stats: CacheStats,
+}
+
+/// Everything needed to replay a parsed build-script result into Cargo's
+/// normal in-memory and on-disk build state.
+#[derive(Clone)]
+pub(crate) struct BuildScriptReplay {
+    entry: BuildScriptCacheEntry,
+    output_file: PathBuf,
+    stderr_file: PathBuf,
+    root_output_file: PathBuf,
+    script_out_dir: PathBuf,
+    build_script_outputs: Arc<Mutex<BuildScriptOutputs>>,
+    package_id: PackageId,
+    metadata: super::UnitHash,
+    library_name: Option<String>,
+    package_description: String,
+    nightly_features_allowed: bool,
+    targets: Vec<Target>,
+    msrv: Option<RustVersion>,
+    json_messages: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct BuildScriptIdentity {
+    package_id: String,
+    package_source: String,
+    target: String,
+    host: String,
+    profile: String,
+    features: Vec<String>,
+    rustflags: Vec<String>,
+    toolchain: ToolchainInput,
+    environment: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct BuildScriptCacheManifest {
+    format_version: u8,
+    action_key: String,
+    identity: BuildScriptIdentity,
+    output: String,
+    output_dir: String,
+    environment: BTreeMap<String, Option<String>>,
+    files: Vec<CachedBuildScriptFile>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CachedBuildScriptFile {
+    file: String,
+    artifact: String,
+    size: u64,
+    digest: String,
+}
+
+#[derive(Clone, Debug)]
+struct BuildScriptCacheEntry {
+    root: PathBuf,
+    manifest: BuildScriptCacheManifest,
+}
+
+/// Prepares the optional cache for a `RunCustomBuild` unit. The ordinary
+/// build-script compiler job remains Cargo-owned; only a validated execution
+/// result can be replayed.
+pub(crate) fn prepare_build_script(
+    build_runner: &BuildRunner<'_, '_>,
+    unit: &Unit,
+) -> CargoResult<Option<BuildScriptCache>> {
+    let Some(key) = build_script_action_key(build_runner, unit) else {
+        return Ok(None);
+    };
+    let Some(identity) = build_script_identity(build_runner, unit) else {
+        return Ok(None);
+    };
+    let run_root = build_runner.files().build_script_run_dir(unit);
+    let output_file = if build_runner.bcx.gctx.cli_unstable().build_dir_new_layout {
+        run_root.join("stdout")
+    } else {
+        run_root.join("output")
+    };
+    let root_output_file = run_root.join("root-output");
+    let stderr_file = run_root.join("stderr");
+    let script_out_dir = if build_runner.bcx.gctx.cli_unstable().build_dir_new_layout {
+        build_runner.files().out_dir_new_layout(unit)
+    } else {
+        build_runner.files().build_script_out_dir(unit)
+    };
+    let action = BuildScriptCacheAction {
+        key,
+        cache: cache_root(build_runner),
+        identity,
+        output_file,
+        stderr_file,
+        root_output_file,
+        script_out_dir,
+        build_script_outputs: Arc::clone(&build_runner.build_script_outputs),
+        package_id: unit.pkg.package_id(),
+        metadata: build_runner.get_run_build_script_metadata(unit),
+        stats: build_runner.cas_stats.clone(),
+    };
+    action.stats.eligible();
+    let replay = action.lookup().map(|entry| BuildScriptReplay {
+        entry,
+        output_file: action.output_file.clone(),
+        stderr_file: action.stderr_file.clone(),
+        root_output_file: action.root_output_file.clone(),
+        script_out_dir: action.script_out_dir.clone(),
+        build_script_outputs: Arc::clone(&action.build_script_outputs),
+        package_id: action.package_id,
+        metadata: action.metadata,
+        library_name: unit.pkg.library().map(|target| target.crate_name()),
+        package_description: unit.pkg.to_string(),
+        nightly_features_allowed: build_runner.bcx.gctx.nightly_features_allowed,
+        targets: unit.pkg.targets().to_vec(),
+        msrv: unit.pkg.rust_version().cloned(),
+        json_messages: build_runner.bcx.build_config.emit_json(),
+    });
+    Ok(Some(BuildScriptCache { action, replay }))
+}
+
+impl BuildScriptCache {
+    pub(crate) fn replay(&self) -> Option<BuildScriptReplay> {
+        self.replay.clone()
+    }
+
+    pub(crate) fn is_hit(&self) -> bool {
+        self.replay.is_some()
+    }
+
+    /// Publishes the execution result after Cargo's normal build-script work
+    /// has completed and populated `BuildScriptOutputs`.
+    pub(crate) fn publication_work(&self) -> Work {
+        let action = self.action.clone();
+        Work::new(move |_| {
+            action.publish();
+            Ok(())
+        })
+    }
+}
+
+impl BuildScriptCacheAction {
+    fn lookup(&self) -> Option<BuildScriptCacheEntry> {
+        if !is_plain_directory(&self.cache) {
+            self.stats.miss();
+            return None;
+        }
+        let root = self.cache.join(self.key.as_str());
+        if !is_plain_directory(&root) {
+            self.stats.miss();
+            return None;
+        }
+        let manifest_path = root.join(BUILD_SCRIPT_MANIFEST_FILE);
+        let Ok(bytes) = read_regular_file(&manifest_path) else {
+            self.stats.miss();
+            return None;
+        };
+        let Ok(manifest) = serde_json::from_slice::<BuildScriptCacheManifest>(&bytes) else {
+            self.stats.reject();
+            return None;
+        };
+        if manifest.format_version != CACHE_FORMAT_VERSION
+            || manifest.action_key != self.key.as_str()
+            || manifest.identity != self.identity
+            || !declared_environment_matches(&manifest.environment)
+            || !validate_build_script_entry(&root, &manifest)
+        {
+            self.stats.reject();
+            return None;
+        }
+        mark_used(&self.cache, self.key.as_str());
+        self.stats.hit();
+        Some(BuildScriptCacheEntry { root, manifest })
+    }
+
+    fn publish(&self) {
+        let result = self.publish_inner();
+        if let Err(error) = result {
+            warn!(error = ?error, "failed to publish cargo-cas build-script entry; continuing without cache");
+        }
+    }
+
+    fn publish_inner(&self) -> CargoResult<()> {
+        let output = self
+            .build_script_outputs
+            .lock()
+            .expect("build script outputs lock poisoned")
+            .get(self.metadata)
+            .cloned();
+        let Some(output) = output else {
+            return Ok(());
+        };
+        if !build_script_output_is_representable(&output) {
+            debug!("cargo-cas skips non-replayable build-script output");
+            return Ok(());
+        }
+        let bytes = read_regular_file(&self.output_file)?;
+        let output_text = String::from_utf8(bytes.clone()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "build-script output is not UTF-8",
+            )
+        })?;
+        let output_dir = self.script_out_dir.to_str().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "build-script output path is not UTF-8")
+        })?;
+        let files = collect_build_script_files(&self.script_out_dir)?;
+        let declared_environment = output
+            .rerun_if_env_changed
+            .iter()
+            .map(|name| (name.clone(), std::env::var(name).ok()))
+            .collect::<BTreeMap<_, _>>();
+
+        ensure_cache_root(&self.cache)?;
+        let final_entry = self.cache.join(self.key.as_str());
+        if fs::symlink_metadata(&final_entry).is_ok() {
+            if build_script_entry_is_valid(&final_entry, &self.key, &self.identity) {
+                mark_used(&self.cache, self.key.as_str());
+                return Ok(());
+            }
+            remove_entry(&final_entry)?;
+        }
+
+        let temporary_entry = ensure_cache_subdirectory(&self.cache, "tmp")?.join(format!(
+            "build-script-{}-{}-{}",
+            self.key.as_str(),
+            std::process::id(),
+            TEMPORARY_ENTRY_COUNTER.fetch_add(1, Ordering::Relaxed),
+        ));
+        let temporary_artifacts = temporary_entry.join(ARTIFACTS_DIRECTORY);
+        fs::create_dir_all(&temporary_artifacts)?;
+        let mut manifest_files = Vec::with_capacity(files.len());
+        for (index, relative, source) in files {
+            let destination = temporary_artifacts.join(index.to_string());
+            fs::copy(&source, &destination)?;
+            let metadata = fs::metadata(&destination)?;
+            manifest_files.push(CachedBuildScriptFile {
+                file: format!("{}", relative.display()),
+                artifact: index.to_string(),
+                size: metadata.len(),
+                digest: digest_file(&destination)?,
+            });
+        }
+        let manifest = BuildScriptCacheManifest {
+            format_version: CACHE_FORMAT_VERSION,
+            action_key: self.key.0.clone(),
+            identity: self.identity.clone(),
+            output: output_text,
+            output_dir: output_dir.to_owned(),
+            environment: declared_environment,
+            files: manifest_files,
+        };
+        paths::write_atomic(
+            temporary_entry.join(BUILD_SCRIPT_MANIFEST_FILE),
+            serde_json::to_vec(&manifest)?,
+        )?;
+        if !build_script_entry_is_valid(&temporary_entry, &self.key, &self.identity) {
+            let _ = fs::remove_dir_all(&temporary_entry);
+            return Ok(());
+        }
+        if let Err(error) = fs::rename(&temporary_entry, &final_entry)
+            && error.kind() != io::ErrorKind::AlreadyExists
+        {
+            return Err(error.into());
+        }
+        if temporary_entry.exists() {
+            let _ = fs::remove_dir_all(&temporary_entry);
+        }
+        mark_used(&self.cache, self.key.as_str());
+        Ok(())
+    }
+}
+
+impl BuildScriptReplay {
+    pub(crate) fn work(self) -> Work {
+        Work::new(move |state| self.replay_inner(state))
+    }
+
+    fn replay_inner(self, state: &super::job_queue::JobState<'_, '_>) -> CargoResult<()> {
+        if fs::symlink_metadata(&self.script_out_dir).is_ok() {
+            if !is_plain_directory(&self.script_out_dir) {
+                return Err(io::Error::other("build-script output directory is not a directory").into());
+            }
+            fs::remove_dir_all(&self.script_out_dir)?;
+        }
+        paths::create_dir_all(&self.script_out_dir)?;
+        let artifact_root = self.entry.root.join(ARTIFACTS_DIRECTORY);
+        for file in &self.entry.manifest.files {
+            let source = artifact_root.join(&file.artifact);
+            let destination = safe_join(&self.script_out_dir, &file.file)?;
+            if let Some(parent) = destination.parent() {
+                paths::create_dir_all(parent)?;
+            }
+            copy_verified_artifact(&source, &destination, file.size, &file.digest)?;
+        }
+        if let Some(parent) = self.output_file.parent() {
+            paths::create_dir_all(parent)?;
+        }
+        paths::write(&self.output_file, self.entry.manifest.output.as_bytes())?;
+        paths::write(&self.stderr_file, b"")?;
+        paths::write(&self.root_output_file, paths::path2bytes(&self.script_out_dir)?)?;
+        let parsed = BuildOutput::parse(
+            self.entry.manifest.output.as_bytes(),
+            self.library_name,
+            &self.package_description,
+            Path::new(&self.entry.manifest.output_dir),
+            &self.script_out_dir,
+            self.nightly_features_allowed,
+            &self.targets,
+            &self.msrv,
+        )?;
+        if self.json_messages {
+            super::custom_build::emit_build_output(
+                state,
+                &parsed,
+                &self.script_out_dir,
+                self.package_id,
+            )?;
+        }
+        self.build_script_outputs
+            .lock()
+            .expect("build script outputs lock poisoned")
+            .insert(self.package_id, self.metadata, parsed);
+        Ok(())
+    }
+}
+
 
 #[derive(Serialize)]
 struct CacheKeyInputV0<'a> {
@@ -209,6 +567,15 @@ enum PackageSourceInput<'a> {
         canonical_url: String,
         revision: &'a str,
         reference: String,
+    },
+    /// A local path source is conservative about relocation: the canonical
+    /// checkout root remains part of the identity, while `snapshot` captures
+    /// every regular package file. This supports repeated builds from the
+    /// same checkout without treating an unrelated checkout with coincident
+    /// bytes as the same source.
+    Path {
+        canonical_root: String,
+        snapshot: String,
     },
 }
 
@@ -573,6 +940,9 @@ pub(crate) fn publication(
         identity,
         cache: cache_root(build_runner),
         artifacts: artifact_paths(build_runner, unit)?,
+        build_script_outputs: build_runner
+            .find_build_script_metadatas(unit)
+            .map(|metadata| (Arc::clone(&build_runner.build_script_outputs), metadata)),
     }))
 }
 
@@ -590,6 +960,17 @@ impl CachePublication {
     }
 
     fn publish_inner(&self) -> CargoResult<()> {
+        if let Some((outputs, metadata)) = &self.build_script_outputs {
+            let outputs = outputs.lock().expect("build script outputs lock poisoned");
+            if metadata.iter().any(|metadata| {
+                outputs
+                    .get(*metadata)
+                    .is_none_or(|output| !build_script_output_is_representable(output))
+            }) {
+                debug!("cargo-cas skips unit with non-replayable build-script output");
+                return Ok(());
+            }
+        }
         // Cargo's encoded dep-info has a relative path representation, but a
         // unit may still record an absolute or environment input that V0 does
         // not represent in its pre-compilation identity. Do not publish those
@@ -734,6 +1115,104 @@ fn action_key(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> Option<ActionK
     action_key_inner(build_runner, unit, &mut visiting)
 }
 
+fn build_script_action_key(
+    build_runner: &BuildRunner<'_, '_>,
+    unit: &Unit,
+) -> Option<ActionKey> {
+    if !unit.mode.is_run_custom_build() || !build_script_is_representable(build_runner, unit) {
+        return None;
+    }
+    let identity = build_script_identity(build_runner, unit)?;
+    let bytes = serde_json::to_vec(&identity).ok()?;
+    let mut input = b"cargo-cas-build-script-v1\0".to_vec();
+    input.extend_from_slice(&bytes);
+    Some(ActionKey(blake3::hash(&input).to_hex().to_string()))
+}
+
+fn build_script_identity(
+    build_runner: &BuildRunner<'_, '_>,
+    unit: &Unit,
+) -> Option<BuildScriptIdentity> {
+    let source = package_source_input(unit)?;
+    let package_source = serde_json::to_string(&source).ok()?;
+    let environment = build_script_environment_input()?;
+    Some(BuildScriptIdentity {
+        package_id: unit.pkg.package_id().to_string(),
+        package_source,
+        target: unit.target.name().to_owned(),
+        host: build_runner.bcx.host_triple().to_string(),
+        profile: serde_json::to_string(&unit.profile).ok()?,
+        features: unit.features.iter().map(ToString::to_string).collect(),
+        rustflags: unit.rustflags.to_vec(),
+        toolchain: toolchain_input(build_runner)?,
+        environment,
+    })
+}
+
+fn build_script_is_representable(
+    build_runner: &BuildRunner<'_, '_>,
+    unit: &Unit,
+) -> bool {
+    if !cfg!(target_os = "macos")
+        || !build_runner.bcx.gctx.cli_unstable().cargo_cas
+        || !unit.mode.is_run_custom_build()
+        || !unit.kind.is_host()
+        || unit.pkg.manifest().links().is_some()
+        || build_runner.bcx.rustc().wrapper.is_some()
+    {
+        return false;
+    }
+    // A build dependency can execute arbitrary code and feed undeclared
+    // values into the script. Keep this first replay model closed over the
+    // package's own build script and Cargo's declared inputs.
+    !build_runner
+        .unit_deps(unit)
+        .iter()
+        .any(|dependency| dependency.unit.pkg.package_id() != unit.pkg.package_id())
+}
+
+fn build_script_output_is_representable(output: &BuildOutput) -> bool {
+    output.library_paths.is_empty()
+        && output.library_links.is_empty()
+        && output.linker_args.is_empty()
+        && output.metadata.is_empty()
+        && output
+            .rerun_if_changed
+            .iter()
+            .all(|path| safe_relative_path(path).is_some())
+        && !output
+            .log_messages
+            .iter()
+            .any(|(severity, _)| matches!(severity, super::custom_build::Severity::Error))
+}
+
+/// Capture inherited variables that a build script can observe. Cargo's
+/// target/output-location variables are deliberately omitted because they are
+/// workspace-local and are rewritten during replay; all other UTF-8 values
+/// participate in the action identity so an environment change cannot reuse a
+/// stale script result.
+fn build_script_environment_input() -> Option<BTreeMap<String, String>> {
+    std::env::vars_os()
+        .filter(|(key, _)| {
+            !matches!(
+                key.to_str(),
+                Some(
+                    "CARGO_HOME"
+                        | "CARGO_TARGET_DIR"
+                        | "CARGO_TARGET_TMPDIR"
+                        | "CARGO_LOG"
+                        | "RUST_LOG"
+                        | "PWD"
+                        | "OLDPWD"
+                        | "SHLVL"
+                        | "_"
+                )
+            )
+        })
+        .map(|(key, value)| Some((key.to_str()?.to_owned(), value.to_str()?.to_owned())))
+        .collect()
+}
+
 fn action_key_inner(
     build_runner: &BuildRunner<'_, '_>,
     unit: &Unit,
@@ -747,7 +1226,11 @@ fn action_key_inner(
         .unit_deps(unit)
         .iter()
         .map(|dependency| {
-            let action_key = action_key_inner(build_runner, &dependency.unit, visiting)?;
+            let action_key = if dependency.unit.mode.is_run_custom_build() {
+                build_script_action_key(build_runner, &dependency.unit)?
+            } else {
+                action_key_inner(build_runner, &dependency.unit, visiting)?
+            };
             Some(DependencyInput {
                 action_key: action_key.0,
                 extern_crate_name: dependency.extern_crate_name.to_string(),
@@ -884,7 +1367,13 @@ fn manifest_identity(
     let mut dependency_action_keys = build_runner
         .unit_deps(unit)
         .iter()
-        .map(|dependency| action_key(build_runner, &dependency.unit).map(|key| key.0))
+        .map(|dependency| {
+            if dependency.unit.mode.is_run_custom_build() {
+                build_script_action_key(build_runner, &dependency.unit).map(|key| key.0)
+            } else {
+                action_key(build_runner, &dependency.unit).map(|key| key.0)
+            }
+        })
         .collect::<Option<Vec<_>>>()?;
     dependency_action_keys.sort_unstable();
     Some(ManifestIdentityV1 {
@@ -944,6 +1433,11 @@ fn ineligibility_reason_in_subgraph_inner(
         return Some("an ineligible dependency action");
     }
     let reason = build_runner.unit_deps(unit).iter().find_map(|dependency| {
+        if dependency.unit.mode.is_run_custom_build() {
+            return build_script_action_key(build_runner, &dependency.unit)
+                .is_none()
+                .then_some("build-script affected");
+        }
         let reason =
             ineligibility_reason_in_subgraph_inner(build_runner, &dependency.unit, visiting)?;
         Some(match reason {
@@ -968,10 +1462,7 @@ fn ineligibility_reason(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> Opti
     if !build_runner.bcx.gctx.cli_unstable().cargo_cas {
         return Some("-Zcargo-cas is not enabled");
     }
-    if source_id.is_path() {
-        return Some("path source");
-    }
-    if !source_id.is_registry() && !source_id.is_git() {
+    if !source_id.is_path() && !source_id.is_registry() && !source_id.is_git() {
         return Some("source is not an immutable registry or git source");
     }
     if package_source_input(unit).is_none() {
@@ -979,9 +1470,6 @@ fn ineligibility_reason(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> Opti
     }
     if unit.is_std {
         return Some("standard library unit");
-    }
-    if unit.pkg.has_custom_build() {
-        return Some("package has a build script");
     }
     if unit.pkg.manifest().links().is_some() {
         return Some("package links native code");
@@ -1037,6 +1525,16 @@ fn ineligibility_reason(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> Opti
 
 fn package_source_input(unit: &Unit) -> Option<PackageSourceInput<'_>> {
     let source_id = unit.pkg.package_id().source_id();
+    if source_id.is_path() {
+        let root = unit.pkg.root().canonicalize().ok()?;
+        let canonical_root = root.to_str()?.to_owned();
+        let snapshot = path_source_snapshot(&root)?;
+        return Some(PackageSourceInput::Path {
+            canonical_root,
+            snapshot,
+        });
+    }
+
     if source_id.is_registry() {
         return Some(PackageSourceInput::Registry {
             source: source_id.as_encoded_url().to_string(),
@@ -1068,6 +1566,185 @@ fn package_source_input(unit: &Unit) -> Option<PackageSourceInput<'_>> {
     }
 
     None
+}
+
+/// Computes a deterministic snapshot of a local package source.
+///
+/// Cargo's ordinary path fingerprint follows the compiler dep-info after the
+/// fact. A persistent cache key must instead cover the complete package input
+/// before rustc runs, including files a build script or proc-macro could read.
+/// V0 therefore includes every regular file below the package root, excluding
+/// only VCS metadata and Cargo's own `target` output directory. Symlinks and
+/// other special files are deliberately unsupported: following them would
+/// make the snapshot depend on an undeclared path outside the package.
+fn path_source_snapshot(root: &Path) -> Option<String> {
+    let mut files = Vec::new();
+    collect_path_source_files(root, root, &mut files)?;
+    files.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+
+    let mut digest = blake3::Hasher::new();
+    for (relative, bytes) in files {
+        let relative = relative.to_str()?;
+        digest.update(&(relative.len() as u64).to_le_bytes());
+        digest.update(relative.as_bytes());
+        digest.update(&(bytes.len() as u64).to_le_bytes());
+        digest.update(&bytes);
+    }
+    Some(digest.finalize().to_hex().to_string())
+}
+
+fn collect_build_script_files(
+    root: &Path,
+) -> CargoResult<Vec<(usize, PathBuf, PathBuf)>> {
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    if !is_plain_directory(root) {
+        return Err(io::Error::other("build-script output is not a directory").into());
+    }
+    let mut files = Vec::new();
+    collect_build_script_files_inner(root, root, &mut files)?;
+    files.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    let total = files.iter().try_fold(0_u64, |total, (_, path)| {
+        Ok::<_, io::Error>(total.saturating_add(fs::metadata(path)?.len()))
+    })?;
+    if total > 64 * 1024 * 1024 {
+        return Err(io::Error::other("build-script generated files exceed cargo-cas limit").into());
+    }
+    Ok(files
+        .into_iter()
+        .enumerate()
+        .map(|(index, (relative, path))| (index, relative, path))
+        .collect())
+}
+
+fn collect_build_script_files_inner(
+    root: &Path,
+    directory: &Path,
+    files: &mut Vec<(PathBuf, PathBuf)>,
+) -> CargoResult<()> {
+    let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_unstable_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| io::Error::other("build-script output escaped OUT_DIR"))?
+            .to_path_buf();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            collect_build_script_files_inner(root, &path, files)?;
+        } else if file_type.is_file() {
+            if safe_relative_path(&relative).is_none() {
+                return Err(io::Error::other("build-script generated path is unsafe").into());
+            }
+            files.push((relative, path));
+        } else {
+            return Err(io::Error::other("build-script generated a symlink or special file").into());
+        }
+    }
+    Ok(())
+}
+
+fn safe_relative_path(path: &Path) -> Option<PathBuf> {
+    if path.is_absolute() {
+        return None;
+    }
+    let mut safe = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(component) => safe.push(component),
+            _ => return None,
+        }
+    }
+    (!safe.as_os_str().is_empty()).then_some(safe)
+}
+
+fn safe_join(root: &Path, relative: &str) -> CargoResult<PathBuf> {
+    let relative = PathBuf::from(relative);
+    let Some(relative) = safe_relative_path(&relative) else {
+        return Err(io::Error::other("unsafe build-script cache path").into());
+    };
+    Ok(root.join(relative))
+}
+
+fn declared_environment_matches(environment: &BTreeMap<String, Option<String>>) -> bool {
+    environment.iter().all(|(name, expected)| {
+        let actual = std::env::var(name).ok();
+        actual == *expected
+    })
+}
+
+fn validate_build_script_entry(root: &Path, manifest: &BuildScriptCacheManifest) -> bool {
+    if !is_plain_directory(root) || !is_plain_directory(&root.join(ARTIFACTS_DIRECTORY)) {
+        return false;
+    }
+    if manifest.output_dir.is_empty() {
+        return false;
+    }
+    let mut files = BTreeSet::new();
+    manifest.files.iter().all(|file| {
+        let Some(relative) = safe_relative_path(Path::new(&file.file)) else {
+            return false;
+        };
+        if !files.insert(relative) || !is_safe_file_name(&file.artifact) {
+            return false;
+        }
+        let path = root.join(ARTIFACTS_DIRECTORY).join(&file.artifact);
+        fs::symlink_metadata(&path).is_ok_and(|metadata| {
+            metadata.file_type().is_file()
+                && metadata.len() == file.size
+                && digest_file(&path).is_ok_and(|digest| digest == file.digest)
+        })
+    })
+}
+
+fn build_script_entry_is_valid(
+    root: &Path,
+    key: &ActionKey,
+    identity: &BuildScriptIdentity,
+) -> bool {
+    let manifest_path = root.join(BUILD_SCRIPT_MANIFEST_FILE);
+    let Ok(bytes) = read_regular_file(&manifest_path) else {
+        return false;
+    };
+    let Ok(manifest) = serde_json::from_slice::<BuildScriptCacheManifest>(&bytes) else {
+        return false;
+    };
+    manifest.format_version == CACHE_FORMAT_VERSION
+        && manifest.action_key == key.as_str()
+        && manifest.identity == *identity
+        && validate_build_script_entry(root, &manifest)
+}
+
+fn collect_path_source_files(
+    root: &Path,
+    directory: &Path,
+    files: &mut Vec<(PathBuf, Vec<u8>)>,
+) -> Option<()> {
+    let mut entries = fs::read_dir(directory)
+        .ok()?
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    entries.sort_unstable_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        let relative = path.strip_prefix(root).ok()?.to_path_buf();
+        let name = entry.file_name();
+        if entry.file_type().ok()?.is_dir() {
+            if name == ".git" || name == ".hg" || name == ".svn" || name == "target" {
+                continue;
+            }
+            collect_path_source_files(root, &path, files)?;
+        } else if entry.file_type().ok()?.is_file() {
+            files.push((relative, fs::read(path).ok()?));
+        } else {
+            // A symlink or special file could expose an input outside the
+            // package root. A conservative miss is safer than a false hit.
+            return None;
+        }
+    }
+    Some(())
 }
 
 fn is_full_git_oid(revision: &str) -> bool {

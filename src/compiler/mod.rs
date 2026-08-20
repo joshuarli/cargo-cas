@@ -209,7 +209,18 @@ fn compile<'gctx>(
         fingerprint::prepare_init(build_runner, unit)?;
 
         let job = if unit.mode.is_run_custom_build() {
-            custom_build::prepare(build_runner, unit)?
+            let cas_build_script = cas::prepare_build_script(build_runner, unit)?;
+            let replay = cas_build_script
+                .as_ref()
+                .and_then(cas::BuildScriptCache::replay);
+            let mut job = custom_build::prepare(build_runner, unit, replay)?;
+            if let Some(cache) = cas_build_script
+                && !cache.is_hit()
+                && job.freshness().is_dirty()
+            {
+                job.after(cache.publication_work());
+            }
+            job
         } else if unit.mode.is_doc_test() {
             // We run these targets later, so this is just a no-op for now.
             Job::new_fresh()
