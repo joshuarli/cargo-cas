@@ -1,4 +1,4 @@
-# `cargo-cas` V1 results
+# `cargo-cas` V1 storage / V2 manifest results
 
 This report records reproducible macOS measurements for the experimental,
 opt-in `-Zcargo-cas` implementation. It is evidence for the conservative V1
@@ -9,8 +9,8 @@ subset, not a claim that every Cargo unit is cacheable.
 | Field | Value |
 | --- | --- |
 | Upstream Cargo source | `514c56dd7321eecbfdcf9b6479519cf4edfab906` |
-| `cargo-cas` source used for the release binary | `e30c34ede51454552e083008aff806bacb350962` |
-| Cache format | `cargo-cas-v1` / manifest format `1` |
+| `cargo-cas` source used for the release binary | `531e80be28e926d889db6535eefc8ed087b4e091` |
+| Cache format | `cargo-cas-v1` / manifest format `2` |
 | Rustc | `1.97.1 (8bab26f4f 2026-07-14)`, LLVM `22.1.6` |
 | OS | macOS `26.5.2` (`25F84`) |
 | CPU | Apple M1 Max, 10 logical CPUs |
@@ -34,21 +34,28 @@ rounded wall time—are the meaningful result.
 | --- | ---: | ---: | ---: |
 | Upstream cold | 1 | 3 | 0 s |
 | Upstream same workspace warm | 0 | 0 | 0 s |
-| Upstream unrelated workspace warm | 1 | 3 | 1 s |
-| Upstream concurrent 2 | 2 | 6 | 0 s |
+| Upstream unrelated workspace warm | 1 | 3 | 0 s |
+| Upstream concurrent 2 | 2 | 6 | 1 s |
 | Upstream concurrent 4 | 4 | 12 | 1 s |
 | Upstream concurrent 8 | 8 | 24 | 2 s |
-| cargo-cas cold | 1 | 3 | 0 s |
+| cargo-cas cold | 1 | 3 | 1 s |
 | cargo-cas same workspace warm | 0 | 0 | 0 s |
 | cargo-cas unrelated workspace warm | 0 | 2 | 0 s |
-| cargo-cas concurrent 2 | 1 | 5 | 0 s |
+| cargo-cas concurrent 2 | 1 | 5 | 1 s |
 | cargo-cas concurrent 4 | 1 | 9 | 1 s |
-| cargo-cas concurrent 8 | 1 | 17 | 2 s |
+| cargo-cas concurrent 8 | 1 | 17 | 1 s |
 
 The decisive comparisons are the unrelated workspace (one avoided shared
 compile) and the 2/4/8 worktree cohorts (1 shared compile instead of 2/4/8).
 The remaining rustc processes are independent root crates, which V1 correctly
 keeps local.
+
+| Derived comparison | Result |
+| --- | --- |
+| Cold overhead | 1 s in this rounded run (upstream rounded to 0 s); both invoked the same 3 `rustc` processes. |
+| Unrelated workspace | Avoided 1 of 1 duplicate shared-dependency compilations and reduced total `rustc` from 3 to 2. |
+| Concurrent 2 / 4 / 8 | Avoided 1 / 3 / 7 duplicate shared compilations, or 50% / 75% / 87.5% of that shared work. |
+| Wall time | The small fixture is timer-noise limited; process counts, not rounded seconds, are the meaningful speed metric. |
 
 For equivalent sets of two sequential workspaces plus 2, 4, and 8 worktrees:
 
@@ -59,20 +66,26 @@ For equivalent sets of two sequential workspaces plus 2, 4, and 8 worktrees:
 | cargo-cas immutable cache | 49,152 |
 | cargo-cas local targets plus cache | 1,458,176 |
 
-This small fixture saves 49,152 bytes after counting the cache itself. It is a
-sanity check on the intended ownership boundary, not a claim of large
+This small fixture saves 49,152 bytes (3.3%) after counting the cache itself.
+It is a sanity check on the intended ownership boundary, not a claim of large
 real-world disk savings. CPU time was not recorded because the synthetic run is
 below the timer's useful resolution.
 
 ### Lock-scaling check
 
-The benchmark also creates 64 independent immutable Git packages and pauses
-their first `rustc` invocations after their CAS locks have been acquired. With
-`-j 8`, it observed 64 dependency `rustc` processes (66 total), 6 s wall time,
-and **8** open CAS lock descriptors. The graph therefore has 64 ActionKeys but
-the live lock count is bounded by Cargo's job concurrency, not graph size. This
-additive stress graph occupied 786,432 cache bytes and 1,634,304 local-target
-bytes; it is deliberately excluded from the equivalent-workspace storage table
+The benchmark also creates **256** independent immutable Git packages and
+pauses their first `rustc` invocations after their CAS locks have been
+acquired. With `-j 8`, it observed 256 dependency `rustc` processes (258
+total), 23 s wall time, and at most **8** open CAS lock descriptors (the script
+fails if the bound is exceeded). The graph therefore has 256 ActionKeys but the
+live lock count is bounded by Cargo's job concurrency, not graph size.
+
+It also records the final root compiler invocation: 1,051 argv entries / 93,148
+bytes, 256 `-L` entries, 256 `--extern` entries, 24 `PATH` entries, 0 dynamic
+library path entries, and 1,550 target files traversed. This makes the direct
+dependency search-path cost explicit instead of hiding it behind the cache. The
+stress graph added 3,145,728 cache bytes and 6,365,184 local-target bytes;
+these are deliberately excluded from the equivalent-workspace storage table
 above.
 
 ### Reproduce
@@ -85,14 +98,16 @@ git worktree add --detach /tmp/cargo-upstream 514c56dd7321eecbfdcf9b6479519cf4ed
 
 CARGO_UPSTREAM_BIN=/tmp/cargo-upstream/target/release/cargo \
   CARGO_CAS_BIN="$PWD/target/release/cargo" \
+  CARGO_CAS_SCALE_ACTIONS=256 \
   ./scripts/benchmark-cas.sh
 ```
 
 Set `CARGO_CAS_BENCHMARK_KEEP=1` to retain the isolated inputs, target
 directories, logs, and counters for inspection. The default includes the
-64-action lock-scaling check; set `CARGO_CAS_SCALE_ACTIONS` and
-`CARGO_CAS_SCALE_JOBS` to adjust it. This macOS-only check uses `lsof` to count
-the Cargo process's live `cargo-cas-v1/locks` descriptors.
+64-action check; set `CARGO_CAS_SCALE_ACTIONS` and `CARGO_CAS_SCALE_JOBS` to
+adjust it. This macOS-only check uses `lsof` to count the Cargo process's live
+`cargo-cas-v1/locks` descriptors and records the root argv/search-path
+dimensions above.
 
 ## Real-world cacheability experiment
 
@@ -101,21 +116,23 @@ Three pinned public repositories were checked sequentially with one fresh
 `CARGO_LOG=cargo::compiler::cas=debug`. Counts are parsed from the structured
 cache-decision logs; `rustc` is the observed number of compiler invocations.
 
-| Repository | Revision | rustc | Hits | Misses | Skips | Wall time |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| ripgrep 14.1.1 | `4649aa9700619f94cf9c66876e9549d83420e16c` | 22 | 0 | 32 | 23 | 5.55 s |
-| fd 10.2.0 | `b19136871310b01500b4f09eadd7387b8476be47` | 52 | 7 | 58 | 33 | 6.89 s |
-| bat 0.25.0 | `25f4f96ea3afb6fe44552f3b38ed8b1540ffa1b3` | 55 | 95 | 0 | 72 | 15.85 s |
+| Repository | Revision | CAS-classified units | Eligible | Hits | Misses | Skips | rustc | Wall time |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| ripgrep 14.1.1 | `4649aa9700619f94cf9c66876e9549d83420e16c` | 39 | 16 | 0 | 16 | 23 | 26 | 3.55 s |
+| fd 10.2.0 | `b19136871310b01500b4f09eadd7387b8476be47` | 69 | 36 | 7 | 29 | 33 | 59 | 3.95 s |
+| bat 0.25.0 | `25f4f96ea3afb6fe44552f3b38ed8b1540ffa1b3` | 167 | 95 | 9 | 86 | 72 | 134 | 12.44 s |
 
-The shared cache occupied 95,969,280 bytes across 131 entries after the three
-runs. The observed skip reasons were 55 build-script units, 52 units with an
-ineligible dependency action, 15 path/workspace units, and 6 proc-macro units.
-This is the intended conservative result: cacheability is not expanded merely
-to improve the hit rate.
+Each row was rerun from the release binary recorded above. “CAS-classified” is
+the structured summary's `eligible + skips`: the units considered by the V0
+classifier. The shared cache occupied 97,529,856 bytes across 131 entries
+after the three runs. The observed skip reasons were 55 packages with build
+scripts, 51 build-script-affected actions, 15 path/workspace units, 6 proc
+macros, and 1 proc-macro-affected action. This is the intended conservative
+result: cacheability is not expanded merely to improve the hit rate.
 
-The bat run is especially useful as a cross-repository warm case: it restored
-95 eligible actions without a new eligible miss, while its local and excluded
-units still compiled normally. Every project completed successfully.
+The fd and bat rows demonstrate cross-repository warm reuse (7 and 9 hits)
+while local and excluded units still compile normally. Every project completed
+successfully.
 
 ### Reproduce
 
@@ -138,3 +155,59 @@ Use a clean target directory for every repository. Preserve the shared
 `CARGO_HOME` across the sequence; otherwise no cross-repository cache reuse is
 possible. Pinned revisions above keep the experiment repeatable even when the
 repositories' default branches advance.
+
+## Completion report
+
+### Thesis and cacheability
+
+Yes: an eligible immutable registry or resolved-Git dependency can be restored
+into an unrelated macOS workspace without invoking that dependency's `rustc`.
+V0 accepts only native-host, non-incremental `lib`/`rlib` check or build units
+whose source has an immutable checksum/revision, with no build script,
+proc-macro influence, native linking, wrapper, path/workspace source, final
+artifact, or unrepresentable local input. Everything else is a normal Cargo
+compile with an explicit debug skip reason.
+
+### Correctness, artifacts, and recovery
+
+The ActionKey serializes source identity, target/mode/profile/LTO, full
+toolchain identity, effective flags/compiler contract, features, and recursive
+dependency ActionKeys. Gate 1 proves matching `.rmeta`, `.rlib`, and archive
+members across unrelated workspaces; V0 copies only those immutable compiler
+artifacts plus validated relative translated dep-info and optional diagnostic
+output cache. Fingerprints remain destination-local.
+
+The permanent invalidation matrix covers source/checksum, features,
+profile/opt-level/debug/debug assertions/overflow/panic/LTO/codegen/split
+debuginfo, flags/config/toolchain, target, and dependency identity. Corrupt,
+missing, old-format, interrupted, symlink-substituted, or late-disappearing
+entries reject or fall back to ordinary rustc; publication is atomic and
+best-effort. Cache hits replay Cargo diagnostics and preserve metadata
+pipelining.
+
+### Concurrency and upstream direction
+
+Same-key writers coordinate through a per-ActionKey lock; different keys do
+not serialize; the eight-worktree test proves one missing action compiles once,
+every reader observes a hit, and all manifests/digests validate. Cargo's
+build-dir v2, fine-grained-locking, and artifact-uplift boundaries are retained.
+This is compatible with the direction of [#5931](https://github.com/rust-lang/cargo/issues/5931),
+[#14125](https://github.com/rust-lang/cargo/issues/14125),
+[#15010](https://github.com/rust-lang/cargo/issues/15010),
+[#16155](https://github.com/rust-lang/cargo/pull/16155), and
+[#16147](https://github.com/rust-lang/cargo/issues/16147): upstreamable pieces
+are canonical action input auditing, immutable-entry validation, and normal-job
+materialization. The fork-local `-Zcargo-cas` storage/coordination policy stays
+experimental.
+
+### Precise remaining blockers
+
+Proc macros remain excluded because their execution loads host dylibs and can
+observe host/process state; build-script-affected actions remain excluded
+because generated files, emitted environment, and native linker inputs lack a
+closed ActionKey model. GC is local, explicit age/size eviction only—there is
+no automatic global-cache policy. Remote transfer is absent. Path sensitivity
+is handled by rejecting any encoded dep-info absolute path, not remapping it.
+`cargo clean` intentionally leaves immutable global entries alone; a hit
+re-materializes local state. Metadata pipelining is preserved only for the
+current rmeta/linkable artifact contract.
