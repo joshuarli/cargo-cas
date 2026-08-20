@@ -106,6 +106,8 @@ mod freshness;
 mod freshness_checksum;
 mod future_incompat_report;
 mod generate_lockfile;
+#[cfg(target_os = "macos")]
+mod gate1_relocatability;
 mod git;
 mod git_auth;
 mod git_gc;
