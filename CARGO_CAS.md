@@ -568,6 +568,13 @@ The specific hypotheses to test are:
 5. macOS filesystem timestamp precision causes any current Cargo freshness
    behavior that a CAS hit must preserve.
 
+The V0 action implementation therefore records both Cargo's full `rustc -vV`
+output and the canonical compiler executable path plus sysroot path. The latter
+two are intentionally distinct inputs: a toolchain shim can report an
+unchanged version banner while changing code generation, and a sysroot can
+provide compilation inputs not represented in that banner. The corresponding
+regression test uses two such shims and requires a cache miss.
+
 If artifacts are not relocatable, record the exact rustc/Cargo path input that
 requires remapping or exclusion. Do not paper over it by copying arbitrary
 workspace metadata into the global entry.

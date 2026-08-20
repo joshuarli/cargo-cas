@@ -39,6 +39,16 @@ fn run_check_with_cas_log(project: &Project, target_dir: &Path) -> RawOutput {
     cargo.run()
 }
 
+fn run_check_with_rustc(project: &Project, target_dir: &Path, rustc: &Path) -> RawOutput {
+    let mut cargo = project.cargo("check -Zcargo-cas -vv");
+    cargo
+        .arg("--target-dir")
+        .arg(target_dir)
+        .env("RUSTC", rustc)
+        .masquerade_as_nightly_cargo(&["cargo-cas"]);
+    cargo.run()
+}
+
 fn run_build(project: &Project, target_dir: &Path) -> RawOutput {
     let mut cargo = project.cargo("build -Zcargo-cas -vv");
     cargo
@@ -108,6 +118,23 @@ exec rustc "$@"
 "#,
     )
     .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).unwrap();
+    }
+    path
+}
+
+fn rustc_proxy(name: &str, extra_cfg: Option<&str>) -> std::path::PathBuf {
+    let path = paths::root().join(name);
+    let extra_cfg = extra_cfg
+        .map(|cfg| format!("--cfg {cfg} "))
+        .unwrap_or_default();
+    fs::write(&path, format!("#!/bin/sh\nexec rustc {extra_cfg}\"$@\"\n")).unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -425,6 +452,74 @@ edition = "2024"
         String::from_utf8_lossy(&skip_output.stderr).contains("cargo-cas skip: path source"),
         "an ineligible unit must report why it was skipped:\n{}",
         String::from_utf8_lossy(&skip_output.stderr)
+    );
+}
+
+#[cargo_test]
+fn compiler_path_is_part_of_the_cargo_cas_action_identity() {
+    const PACKAGE: &str = "cas-toolchain-identity-dep";
+    const CRATE: &str = "cas_toolchain_identity_dep";
+
+    registry::init();
+    Package::new(PACKAGE, "1.0.0")
+        .edition("2024")
+        .file(
+            "src/lib.rs",
+            r#"
+#[cfg(cas_toolchain_b)]
+pub const VALUE: usize = 2;
+
+#[cfg(not(cas_toolchain_b))]
+pub const VALUE: usize = 1;
+"#,
+        )
+        .publish();
+
+    let manifest = format!(
+        r#"[package]
+name = "cas-toolchain-identity-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+{PACKAGE} = "1.0.0"
+"#,
+    );
+    let first = project_in("cas-toolchain-identity-first")
+        .file("Cargo.toml", &manifest)
+        .file(
+            "src/main.rs",
+            "fn main() { let _ = cas_toolchain_identity_dep::VALUE; }\n",
+        )
+        .build();
+    let second = project_in("cas-toolchain-identity-second")
+        .file("Cargo.toml", &manifest)
+        .file(
+            "src/main.rs",
+            "const _: [(); 2] = [(); cas_toolchain_identity_dep::VALUE];\nfn main() {}\n",
+        )
+        .build();
+
+    // Both proxies report the same `rustc -vV` data. The second one changes
+    // actual compiler behavior, so accepting the first entry by verbose
+    // version alone would produce an invalid cross-crate constant here.
+    let rustc_a = rustc_proxy("cas-rustc-a", None);
+    let rustc_b = rustc_proxy("cas-rustc-b", Some("cas_toolchain_b"));
+    let first_output = run_check_with_rustc(
+        &first,
+        &paths::root().join("cas-toolchain-identity-first-target"),
+        &rustc_a,
+    );
+    assert!(crate_was_compiled(&first_output, CRATE));
+    let second_output = run_check_with_rustc(
+        &second,
+        &paths::root().join("cas-toolchain-identity-second-target"),
+        &rustc_b,
+    );
+    assert!(
+        crate_was_compiled(&second_output, CRATE),
+        "a distinct compiler path must not reuse an entry from another compiler:\n{}",
+        String::from_utf8_lossy(&second_output.stderr)
     );
 }
 

@@ -81,7 +81,13 @@ struct CacheKeyInputV0<'a> {
     mode: &'static str,
     profile: &'a crate::workspace::profiles::Profile,
     lto: LtoInput,
+    /// `rustc -vV` is not sufficient when two executable paths deliberately
+    /// report the same version while compiling differently.
+    rustc_path: String,
     rustc_verbose_version: &'a str,
+    /// The sysroot can contribute crates and linker inputs not represented by
+    /// the compiler's version banner alone.
+    sysroot: String,
     rustflags: &'a [String],
     extra_args: &'a [String],
     features: Vec<String>,
@@ -531,6 +537,13 @@ fn action_key_inner(
         .extra_args_for(unit)
         .map(Vec::as_slice)
         .unwrap_or_default();
+    let rustc_path = paths::resolve_executable(&build_runner.bcx.rustc().path)
+        .ok()?
+        .canonicalize()
+        .ok()?
+        .to_str()?
+        .to_owned();
+    let sysroot = build_runner.bcx.get_sysroot().to_str()?.to_owned();
     let input = CacheKeyInputV0 {
         format_version: CACHE_FORMAT_VERSION,
         package: PackageInput {
@@ -557,7 +570,9 @@ fn action_key_inner(
         },
         profile: &unit.profile,
         lto: lto_input(build_runner.lto[unit]),
+        rustc_path,
         rustc_verbose_version: &build_runner.bcx.rustc().verbose_version,
+        sysroot,
         rustflags: &unit.rustflags,
         extra_args,
         features: unit
