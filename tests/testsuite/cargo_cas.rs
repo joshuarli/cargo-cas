@@ -39,6 +39,17 @@ fn run_check_with_cas_log(project: &Project, target_dir: &Path) -> RawOutput {
     cargo.run()
 }
 
+fn run_check_with_cas_log_in(project: &Project, cwd: &Path, target_dir: &Path) -> RawOutput {
+    let mut cargo = project.cargo("check -Zcargo-cas -vv");
+    cargo
+        .cwd(cwd)
+        .arg("--target-dir")
+        .arg(target_dir)
+        .env("CARGO_LOG", "cargo::compiler::cas=debug")
+        .masquerade_as_nightly_cargo(&["cargo-cas"]);
+    cargo.run()
+}
+
 fn run_check_with_rustc(project: &Project, target_dir: &Path, rustc: &Path) -> RawOutput {
     let mut cargo = project.cargo("check -Zcargo-cas -vv");
     cargo
@@ -117,6 +128,20 @@ fn run_clean(project: &Project, target_dir: &Path) -> RawOutput {
     let mut cargo = project.cargo("clean -vv");
     cargo.arg("--target-dir").arg(target_dir);
     cargo.run()
+}
+
+fn run_git(root: &Path, arguments: &[&str]) {
+    let output = Command::new("git")
+        .current_dir(root)
+        .args(arguments)
+        .output()
+        .unwrap_or_else(|error| panic!("failed to start git {:?}: {error}", arguments));
+    assert!(
+        output.status.success(),
+        "git {:?} failed:\n{}",
+        arguments,
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn run_cas_gc(project: &Project, options: &str) -> RawOutput {
@@ -467,7 +492,7 @@ pub fn answer() -> u32 { 41 }
     let manifest = cache_manifest();
     let manifest_json: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&manifest).unwrap()).unwrap();
-    assert_eq!(manifest_json["format_version"], 3);
+    assert_eq!(manifest_json["format_version"], 4);
     assert_eq!(manifest_json["identity"]["target_name"], REGISTRY_CRATE);
     assert_eq!(manifest_json["identity"]["compile_mode"], "check");
     assert!(manifest_json["identity"]["package_id"].is_string());
@@ -510,7 +535,7 @@ pub fn answer() -> u32 { 41 }
     );
     let rebuilt_manifest: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&manifest).unwrap()).unwrap();
-    assert_eq!(rebuilt_manifest["format_version"], 3);
+    assert_eq!(rebuilt_manifest["format_version"], 4);
 
     let exact_output = run_check(&exact, &paths::root().join("cas-exact-target"), "");
     assert!(
@@ -740,6 +765,97 @@ edition = "2024"
 }
 
 #[cargo_test]
+fn git_worktree_path_dependencies_share_one_cargo_cas_action() {
+    let project = project_in("cas-path-worktree-sharing")
+        .file(
+            "Cargo.toml",
+            r#"[package]
+name = "cas-path-worktree-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+local-dependency = { path = "local-dependency" }
+"#,
+        )
+        .file("src/main.rs", "fn main() { local_dependency::answer(); }\n")
+        .file(
+            "local-dependency/Cargo.toml",
+            r#"[package]
+name = "local-dependency"
+version = "0.1.0"
+edition = "2024"
+"#,
+        )
+        .file("local-dependency/src/lib.rs", "pub fn answer() {}\n")
+        .build();
+
+    let source = project.root();
+    run_git(&source, &["init", "--quiet"]);
+    run_git(&source, &["add", "."]);
+    run_git(
+        &source,
+        &[
+            "-c",
+            "user.name=cargo-cas-tests",
+            "-c",
+            "user.email=cargo-cas-tests@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "initial",
+        ],
+    );
+
+    let first_root = paths::root().join("cas-path-worktree-sharing-first");
+    let second_root = paths::root().join("cas-path-worktree-sharing-second");
+    run_git(
+        &source,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            first_root.to_str().unwrap(),
+        ],
+    );
+    run_git(
+        &source,
+        &["worktree", "add", "--quiet", "--detach", second_root.to_str().unwrap()],
+    );
+    let first_output = run_check_with_cas_log_in(
+        &project,
+        &first_root,
+        &paths::root().join("cas-path-worktree-sharing-first-target"),
+    );
+    assert!(crate_was_compiled(&first_output, "local_dependency"));
+
+    let second_output = run_check_with_cas_log_in(
+        &project,
+        &second_root,
+        &paths::root().join("cas-path-worktree-sharing-second-target"),
+    );
+    assert!(
+        !crate_was_compiled(&second_output, "local_dependency"),
+        "a matching Git worktree path dependency should restore from cargo-cas:\n{}",
+        String::from_utf8_lossy(&second_output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&second_output.stderr).contains("cargo-cas hit"),
+        "the worktree-shared path action should report a hit:\n{}",
+        String::from_utf8_lossy(&second_output.stderr)
+    );
+    run_git(
+        &source,
+        &["worktree", "remove", "--force", first_root.to_str().unwrap()],
+    );
+    run_git(
+        &source,
+        &["worktree", "remove", "--force", second_root.to_str().unwrap()],
+    );
+}
+
+#[cargo_test]
 fn build_script_and_proc_macro_dependency_subgraphs_use_normal_rustc() {
     const BUILD_SCRIPT_PACKAGE: &str = "cas-build-script-dep";
     const BUILD_SCRIPT_CRATE: &str = "cas_build_script_dep";
@@ -843,7 +959,7 @@ pub fn noop(_input: TokenStream) -> TokenStream { TokenStream::new() }
     let build_script_manifest = build_script_cache_manifest(BUILD_SCRIPT_PACKAGE);
     let build_script_manifest_json: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(build_script_manifest).unwrap()).unwrap();
-    assert_eq!(build_script_manifest_json["format_version"], 3);
+    assert_eq!(build_script_manifest_json["format_version"], 4);
     assert_eq!(build_script_manifest_json["files"].as_array().unwrap().len(), 1);
     assert!(build_script_manifest_json["output"]
         .as_str()

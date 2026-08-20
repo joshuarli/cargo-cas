@@ -33,10 +33,11 @@ use crate::util::CargoResult;
 use crate::workspace::{PackageId, Target};
 use cargo_util_schemas::manifest::RustVersion;
 
-// Version 3 adds content-addressed local path source identity. Entries from
-// older formats cannot prove that a path dependency still has the same source
-// snapshot, so they must be rebuilt rather than accepted as a partial hit.
-const CACHE_FORMAT_VERSION: u8 = 3;
+// Version 4 adds a stable identity for local packages checked out as Git
+// worktrees. Entries from older formats cannot prove that a path dependency
+// still has the same source snapshot or worktree identity, so they must be
+// rebuilt rather than accepted as a partial hit.
+const CACHE_FORMAT_VERSION: u8 = 4;
 const CACHE_DIRECTORY: &str = "cargo-cas-v1";
 const MANIFEST_FILE: &str = "manifest.json";
 const ARTIFACTS_DIRECTORY: &str = "artifacts";
@@ -574,13 +575,21 @@ enum PackageSourceInput<'a> {
         revision: &'a str,
         reference: String,
     },
-    /// A local path source is conservative about relocation: the canonical
-    /// checkout root remains part of the identity, while `snapshot` captures
-    /// every regular package file. This supports repeated builds from the
-    /// same checkout without treating an unrelated checkout with coincident
-    /// bytes as the same source.
+    /// A local path source is conservative about relocation: an ordinary
+    /// checkout keeps its canonical root in the identity, while a package in
+    /// a Git worktree uses the repository's common Git directory, commit, and
+    /// path within that repository. In both cases `snapshot` captures every
+    /// regular package file. This lets detached worktrees of one repository
+    /// share immutable actions without treating an unrelated checkout with
+    /// coincident bytes as the same source.
     Path {
         canonical_root: String,
+        snapshot: String,
+    },
+    GitWorktree {
+        repository: String,
+        revision: String,
+        relative_root: String,
         snapshot: String,
     },
 }
@@ -1385,7 +1394,7 @@ fn manifest_identity(
         .collect::<Option<Vec<_>>>()?;
     dependency_action_keys.sort_unstable();
     Some(ManifestIdentityV1 {
-        package_id: unit.pkg.package_id().to_string(),
+        package_id: manifest_package_id(unit)?,
         target_name: unit.target.name().to_owned(),
         crate_name: unit.target.crate_name(),
         compile_mode: match unit.mode {
@@ -1397,6 +1406,19 @@ fn manifest_identity(
         toolchain: toolchain_input(build_runner)?,
         dependency_action_keys,
     })
+}
+
+/// Package IDs for local sources normally contain the absolute checkout path.
+/// That would make an otherwise identical action from a sibling Git worktree
+/// fail manifest validation even when its ActionKey uses the stable worktree
+/// source identity. Keep registry and immutable-Git IDs in Cargo's familiar
+/// display form, while serializing the already-validated local source identity
+/// for path packages.
+fn manifest_package_id(unit: &Unit) -> Option<String> {
+    if unit.pkg.package_id().source_id().is_path() {
+        return Some(serde_json::to_string(&package_source_input(unit)?).ok()?);
+    }
+    Some(unit.pkg.package_id().to_string())
 }
 
 fn toolchain_input(build_runner: &BuildRunner<'_, '_>) -> Option<ToolchainInput> {
@@ -1535,8 +1557,11 @@ fn package_source_input(unit: &Unit) -> Option<PackageSourceInput<'_>> {
     let source_id = unit.pkg.package_id().source_id();
     if source_id.is_path() {
         let root = unit.pkg.root().canonicalize().ok()?;
-        let canonical_root = root.to_str()?.to_owned();
         let snapshot = path_source_snapshot(&root)?;
+        if let Some(worktree) = git_worktree_source_input(&root, snapshot.clone()) {
+            return Some(worktree);
+        }
+        let canonical_root = root.to_str()?.to_owned();
         return Some(PackageSourceInput::Path {
             canonical_root,
             snapshot,
@@ -1574,6 +1599,34 @@ fn package_source_input(unit: &Unit) -> Option<PackageSourceInput<'_>> {
     }
 
     None
+}
+
+/// Returns a stable identity for a package in a Git checkout or linked
+/// worktree. `Repository::path` points at the per-worktree administrative
+/// directory for linked worktrees, so resolve its optional `commondir` file
+/// before recording the repository identity. Separate clones retain distinct
+/// common Git directories and therefore do not collide merely because their
+/// checked-out bytes and commits happen to match.
+fn git_worktree_source_input(
+    root: &Path,
+    snapshot: String,
+) -> Option<PackageSourceInput<'static>> {
+    let repository = git2::Repository::discover(root).ok()?;
+    let workdir = repository.workdir()?.canonicalize().ok()?;
+    let relative_root = root.strip_prefix(&workdir).ok()?.to_str()?.to_owned();
+    let revision = repository.head().ok()?.target()?.to_string();
+    let git_dir = repository.path().canonicalize().ok()?;
+    let common_dir = match fs::read_to_string(git_dir.join("commondir")) {
+        Ok(relative) => git_dir.join(relative.trim()).canonicalize().ok()?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => git_dir,
+        Err(_) => return None,
+    };
+    Some(PackageSourceInput::GitWorktree {
+        repository: common_dir.to_str()?.to_owned(),
+        revision,
+        relative_root,
+        snapshot,
+    })
 }
 
 /// Computes a deterministic snapshot of a local package source.
@@ -1739,10 +1792,10 @@ fn collect_path_source_files(
         let path = entry.path();
         let relative = path.strip_prefix(root).ok()?.to_path_buf();
         let name = entry.file_name();
+        if name == ".git" || name == ".hg" || name == ".svn" || name == "target" {
+            continue;
+        }
         if entry.file_type().ok()?.is_dir() {
-            if name == ".git" || name == ".hg" || name == ".svn" || name == "target" {
-                continue;
-            }
             collect_path_source_files(root, &path, files)?;
         } else if entry.file_type().ok()?.is_file() {
             files.push((relative, fs::read(path).ok()?));

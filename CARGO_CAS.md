@@ -496,7 +496,7 @@ the resolver, unit graph, or job queue contracts.
 
 | Concern | Narrow insertion point | Required behavior/constraint |
 | --- | --- | --- |
-| Eligibility | `src/compiler/mod.rs::compile`, after the complete `Unit` and `BuildRunner::unit_deps` are known and before the dirty work is selected | Make a conservative closed-world decision. Registry/git packages and same-checkout path packages may participate; deterministic build-script outputs are replayable only inside the explicit boundary in `src/compiler/cas.rs`. Unknown means normal Cargo fallback. |
+| Eligibility | `src/compiler/mod.rs::compile`, after the complete `Unit` and `BuildRunner::unit_deps` are known and before the dirty work is selected | Make a conservative closed-world decision. Registry/git packages and path packages with a complete source identity (including linked Git worktrees) may participate; deterministic build-script outputs are replayable only inside the explicit boundary in `src/compiler/cas.rs`. Unknown means normal Cargo fallback. |
 | Semantic key generation | A helper called from the same compile path, using `CompilationFiles::metadata`, effective profile/kind/mode/flags, source checksum, strict rustc/toolchain identity, and recursively computed dependency keys | Use a versioned canonical structure, not `Fingerprint::hash_u64`, `UnitHash`, `UnitIndex`, Rust's generic `Hash` serialization, or workspace-local paths. Include every effective compiler input that can affect bytes/ABI. Dependency keys form a DAG. |
 | Lookup | In `compile`, after `fingerprint::prepare_target` identifies a dirty eligible unit and before choosing `rustc(...)` | A local fresh unit still follows the ordinary fresh path. A global hit must be validated as a complete entry before scheduling its materialization work. A miss must select the unchanged rustc work. |
 | Publish | Chain a CAS publish `Work` after successful `rustc` work (which has translated dep-info and completed outputs) and before `link_targets`, or place the equivalent finalization at the end of the `rustc` work closure | Stage all artifacts and a validated manifest in a per-writer temporary directory; atomically rename/publish on the same filesystem. Never expose a partial entry as a hit. Coordinate same-key writers without serializing different keys. |
@@ -522,7 +522,8 @@ ActionKey schema:
 ```text
 eligible iff
     source is an immutable registry/git package with a verified identity,
-      or a local path with a complete same-checkout snapshot
+      or a local path with a complete source snapshot (Git worktrees use
+      repository, revision, and package-relative identity)
     && unit is a normal pure-Rust library build
     && compile mode is Build or the explicitly supported Check form
     && every affecting RunCustomBuild has a closed, replayable output
@@ -534,10 +535,12 @@ eligible iff
     && all effective inputs can be represented without workspace-local paths
 ```
 
-Path sources are keyed by canonical checkout root and a BLAKE3 snapshot of all
-regular package files (excluding only VCS metadata and Cargo's `target`
-directory). This is deliberately same-checkout conservative: moving a checkout
-causes a miss until path remapping is proven safe. Build-script entries are
+Path sources outside Git worktrees are keyed by canonical checkout root and a
+BLAKE3 snapshot of all regular package files (excluding only VCS metadata and
+Cargo's `target` directory). A package in a linked Git worktree instead uses
+the common repository Git directory, detached revision, package-relative root,
+and the same snapshot, so sibling worktrees of one checkout can share actions
+without colliding with a separate clone. Build-script entries are
 separate from compiler artifacts and contain the raw parsed output, declared
 environment values, and validated `OUT_DIR` files. A cache miss is always safe
 normal Cargo behavior; a false hit is a correctness bug.

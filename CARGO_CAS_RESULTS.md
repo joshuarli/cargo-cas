@@ -163,10 +163,12 @@ repositories' default branches advance.
 Yes: an eligible immutable registry or resolved-Git dependency can be restored
 into an unrelated macOS workspace without invoking that dependency's `rustc`.
 V0 accepts only native-host, non-incremental `lib`/`rlib` check or build units
-whose source has an immutable checksum/revision, with no build script,
-proc-macro influence, native linking, wrapper, path/workspace source, final
-artifact, or unrepresentable local input. Everything else is a normal Cargo
-compile with an explicit debug skip reason.
+whose source has an immutable checksum/revision or a complete local snapshot,
+with no build script, proc-macro influence, native linking, wrapper, final
+artifact, or unrepresentable local input. Local packages in linked Git
+worktrees use a repository/revision/relative-root identity so their build-mode
+library artifacts can be shared across sibling worktrees. Everything else is a
+normal Cargo compile with an explicit debug skip reason.
 
 ### Correctness, artifacts, and recovery
 
@@ -232,3 +234,24 @@ does not erase earlier baselines.
 | `ish` (historical) | 4 | 1.235x | 1.018x | pass |
 | `pi-agent-core-rs` (historical) | 4 | 1.044x | 1.108x | storage pass; rebuild goal missed |
 | `h12tiny` @ `dd20f45` | 4 | 1.069x | 0.971x | pass |
+| `pi-agent-core-rs` @ `8be4329` | 4 | 1.033x | 0.939x | pass; instrumented |
+| `pi-agent-core-rs` @ `8be4329` | 4 | 1.032x | 1.151x | storage pass; timing goal missed |
+
+The instrumented pi run also records per-`rustc` elapsed time, package, and
+category (`rustc`, build script, or proc macro), plus the package names behind
+each CAS skip reason. In the parallel restore phase, the largest package totals
+were `pi-agent-core` (441.0 s summed across four worktrees), `pi-agent-tui`
+(61.0 s), and `rustls` (60.7 s). Native packages accounted for `ring` (20.9 s)
+and `mlua-sys` (12.6 s); proc-macro rustc time was 38.6 s. The dominant rebuild
+work is therefore the local workspace/test targets, not proc-macro or native
+compilation: rebuild rustc time was 1,798.8 s summed across the four worktrees
+and three rounds, versus 24.5 s build-script and 15.0 s proc-macro time.
+
+The latest run adds Git-worktree path identity for local package build units.
+Parallel restore rose from 373/376 hits to 376/376, and wall time fell from
+106.6 s to 88.4 s while the measured footprint stayed at 1.032x. The three
+source-edit rebuild rounds were timing-noisy (reference median 92.0 s, goal
+median 105.9 s, or 1.151x), so the rebuild threshold missed despite unchanged
+540/540 CAS hits and the storage goal passing. Native and proc-macro units remain
+explicitly visible and excluded: parallel `ring`/`mlua-sys` skips total 16 and
+proc-macro skips total 12.

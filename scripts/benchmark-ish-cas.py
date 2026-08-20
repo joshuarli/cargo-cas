@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Measure cargo-cas storage and parallel rebuilds for four workspace worktrees.
 
-The benchmark uses the current ``~/d/h12tiny`` revision, a private Cargo home
+The benchmark uses the current ``~/d/pi-agent-core-rs`` revision, a private Cargo home
 whose registry is read-only through a symlink, and one target directory inside
 each temporary Git worktree.  It never invokes upstream Cargo: every build is
 run with ``cargo test -Zcargo-cas --workspace --all-targets --all-features
@@ -16,10 +16,12 @@ logs, targets, and cache for inspection.  Set ``CARGO_CAS_ISH_TRACE=0`` to
 remove CAS debug logging from the build environment; tracing is enabled by
 default because it makes hit/miss/skip counts auditable.  The default toolchain
 is pinned to the revision used by the workspace's ``rust-toolchain.toml``.  Rebuild
-timings use three paired source-edit rounds by default; override that count
+ timings use three source-edit rounds for each reference and goal series by default; override that count
 with ``CARGO_CAS_REBUILD_ROUNDS``.  Completed runs append one JSON record to
 ``benchmarks/cargo-cas-workspace-history.jsonl`` (override with
-``CARGO_CAS_RESULTS``), preserving prior project baselines.
+``CARGO_CAS_RESULTS``), preserving prior project baselines.  The rustc proxy
+also records elapsed time, package, and proc-macro/build-script classification;
+CAS debug events provide the per-unit skip reason and package attribution.
 """
 
 from __future__ import annotations
@@ -45,8 +47,8 @@ from typing import Callable
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TOOLCHAIN = "nightly-2026-07-24"
-DEFAULT_PROJECT_DIR = Path.home() / "d" / "h12tiny"
-DEFAULT_EDIT_FILE = Path("src/lib.rs")
+DEFAULT_PROJECT_DIR = Path.home() / "d" / "pi-agent-core-rs"
+DEFAULT_EDIT_FILE = Path("crates/pi-agent-tui/src/main.rs")
 DEFAULT_RESULTS_PATH = REPO_ROOT / "benchmarks" / "cargo-cas-workspace-history.jsonl"
 WORKTREE_COUNT = 4
 MAX_MEASURED_FOOTPRINT_MULTIPLIER = 1.10
@@ -70,6 +72,19 @@ class BuildResult:
 
 
 @dataclass
+class RustcRecord:
+    """One timed rustc invocation emitted by the benchmark proxy."""
+
+    process_pid: int
+    crate: str
+    package: str
+    crate_type: str
+    start_ns: int
+    end_ns: int
+    status: int
+
+
+@dataclass
 class RebuildSeries:
     """Repeated source-edit rebuilds used to make the timing ratio stable."""
 
@@ -77,7 +92,12 @@ class RebuildSeries:
     wall_seconds: list[float]
     slowest_seconds: list[float]
     counts: Counter[str]
+    rustc_seconds: dict[str, float]
+    rustc_package_seconds: dict[str, float]
+    rustc_category_seconds: dict[str, float]
     summary: Counter[str]
+    skip_reasons: Counter[str]
+    skip_packages: dict[str, Counter[str]]
 
 
 def env_path(name: str, default: Path) -> Path:
@@ -325,16 +345,33 @@ def make_rustc_proxy(root: Path) -> Path:
     proxy = root / "counting-rustc"
     proxy.write_text(
         """#!/bin/sh
-set -eu
+set -u
 previous=''
+crate='<unknown>'
+package='<unknown>'
+crate_type='<unknown>'
 for argument in "$@"; do
     if [ "$previous" = '--crate-name' ]; then
-        printf '%s %s\\n' "$PPID" "$argument" >>"$CARGO_CAS_BENCHMARK_RUSTC_LOG"
-        break
+        crate="$argument"
+    elif [ "$previous" = '--crate-type' ]; then
+        crate_type="$argument"
+    elif [ "$previous" = '--out-dir' ]; then
+        package=$(printf '%s' "$argument" | sed -n 's#^.*/build/\\([^/]*\\)/.*#\\1#p')
+        if [ -z "$package" ]; then
+            package='<unknown>'
+        fi
     fi
     previous="$argument"
 done
-exec "$CARGO_CAS_BENCHMARK_REAL_RUSTC" "$@"
+start_ns=$(python3 -c 'import time; print(time.time_ns())')
+set +e
+"$CARGO_CAS_BENCHMARK_REAL_RUSTC" "$@"
+status=$?
+set -e
+end_ns=$(python3 -c 'import time; print(time.time_ns())')
+printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' "$PPID" "$crate" "$package" "$crate_type" "$start_ns" "$end_ns" "$status" \
+    >>"$CARGO_CAS_BENCHMARK_RUSTC_LOG"
+exit "$status"
 """
     )
     proxy.chmod(0o755)
@@ -478,7 +515,12 @@ def run_rebuild_series(
     wall_seconds: list[float] = []
     slowest_seconds: list[float] = []
     counts: Counter[str] = Counter()
+    rustc_seconds: dict[str, float] = {}
+    rustc_package_seconds: dict[str, float] = {}
+    rustc_category_seconds: dict[str, float] = {}
     summary: Counter[str] = Counter()
+    skip_reasons: Counter[str] = Counter()
+    skip_packages: dict[str, Counter[str]] = {}
     for round_index in range(1, rounds + 1):
         edit(round_index)
         results, wall = run_parallel(
@@ -491,22 +533,99 @@ def run_rebuild_series(
         final_results = results
         wall_seconds.append(wall)
         slowest_seconds.append(max(result.seconds for result in results))
-        counts.update(rustc_counts(rustc_log, results))
+        round_counts, round_seconds, round_package_seconds, round_category_seconds = (
+            rustc_timing_summary(rustc_log, results)
+        )
+        counts.update(round_counts)
+        for crate, seconds in round_seconds.items():
+            rustc_seconds[crate] = rustc_seconds.get(crate, 0.0) + seconds
+        for package, seconds in round_package_seconds.items():
+            rustc_package_seconds[package] = rustc_package_seconds.get(package, 0.0) + seconds
+        for category, seconds in round_category_seconds.items():
+            rustc_category_seconds[category] = (
+                rustc_category_seconds.get(category, 0.0) + seconds
+            )
         summary.update(cas_summaries([result.log_path for result in results]))
+        round_reasons, round_packages = cas_skip_observations(
+            [result.log_path for result in results]
+        )
+        skip_reasons.update(round_reasons)
+        for reason, packages in round_packages.items():
+            skip_packages.setdefault(reason, Counter()).update(packages)
         prune_cache_entries(cache_root, preserved_cache_entries)
-    return RebuildSeries(final_results, wall_seconds, slowest_seconds, counts, summary)
+    return RebuildSeries(
+        final_results,
+        wall_seconds,
+        slowest_seconds,
+        counts,
+        rustc_seconds,
+        rustc_package_seconds,
+        rustc_category_seconds,
+        summary,
+        skip_reasons,
+        skip_packages,
+    )
+
+
+def rustc_records(log_path: Path, results: list[BuildResult]) -> list[RustcRecord]:
+    records: list[RustcRecord] = []
+    if not log_path.is_file():
+        return records
+    process_pids = {result.process_pid for result in results}
+    for line in log_path.read_text(errors="replace").splitlines():
+        fields = line.split("\t", 6)
+        if len(fields) != 7:
+            continue
+        try:
+            process_pid, start_ns, end_ns, status = (
+                int(fields[0]),
+                int(fields[4]),
+                int(fields[5]),
+                int(fields[6]),
+            )
+        except ValueError:
+            continue
+        if process_pid in process_pids:
+            records.append(
+                RustcRecord(
+                    process_pid,
+                    fields[1],
+                    fields[2],
+                    fields[3],
+                    start_ns,
+                    end_ns,
+                    status,
+                )
+            )
+    return records
 
 
 def rustc_counts(log_path: Path, results: list[BuildResult]) -> Counter[str]:
     counts: Counter[str] = Counter()
-    if not log_path.is_file():
-        return counts
-    process_pids = {str(result.process_pid) for result in results}
-    for line in log_path.read_text(errors="replace").splitlines():
-        label, separator, crate = line.partition(" ")
-        if separator and label in process_pids and crate:
-            counts[crate] += 1
+    for record in rustc_records(log_path, results):
+        counts[record.crate] += 1
     return counts
+
+
+def rustc_timing_summary(
+    log_path: Path, results: list[BuildResult]
+) -> tuple[Counter[str], dict[str, float], dict[str, float], dict[str, float]]:
+    """Return invocation counts and aggregate rustc seconds by crate/package/category."""
+
+    counts: Counter[str] = Counter()
+    crate_seconds: dict[str, float] = {}
+    package_seconds: dict[str, float] = {}
+    category_seconds: dict[str, float] = {}
+    for record in rustc_records(log_path, results):
+        counts[record.crate] += 1
+        seconds = (record.end_ns - record.start_ns) / 1_000_000_000
+        crate_seconds[record.crate] = crate_seconds.get(record.crate, 0.0) + seconds
+        package_seconds[record.package] = package_seconds.get(record.package, 0.0) + seconds
+        category = "proc-macro" if "proc-macro" in record.crate_type else (
+            "build-script" if record.crate.startswith("build_script_") else "rustc"
+        )
+        category_seconds[category] = category_seconds.get(category, 0.0) + seconds
+    return counts, crate_seconds, package_seconds, category_seconds
 
 
 def cas_summaries(log_paths: list[Path]) -> Counter[str]:
@@ -542,6 +661,43 @@ def cas_summaries(log_paths: list[Path]) -> Counter[str]:
             if isinstance(skips, dict):
                 counts["skips"] += sum(value for value in skips.values() if isinstance(value, int))
     return counts
+
+
+def cas_skip_observations(
+    log_paths: list[Path],
+) -> tuple[Counter[str], dict[str, Counter[str]]]:
+    """Extract per-unit skip reasons and package names from CAS debug events."""
+
+    reasons: Counter[str] = Counter()
+    packages: dict[str, Counter[str]] = {}
+    for path in log_paths:
+        if not path.is_file():
+            continue
+        for line in path.read_text(errors="replace").splitlines():
+            marker = "cargo-cas skip:"
+            if marker not in line:
+                continue
+            package_match = re.search(r"package=(.*?) target=", line)
+            if package_match is None:
+                reason = line.rsplit(marker, 1)[1].strip()
+                reasons[reason] += 1
+                continue
+            reason = line[: package_match.start()].rsplit(marker, 1)[1].strip()
+            reasons[reason] += 1
+            package = package_match.group(1).strip().strip('"')
+            packages.setdefault(reason, Counter())[package] += 1
+    return reasons, packages
+
+
+def format_skip_packages(packages: Counter[str], limit: int = 8) -> str:
+    """Format the most frequent package names for compact phase output."""
+
+    if not packages:
+        return "none"
+    entries = [f"{name}={count}" for name, count in packages.most_common(limit)]
+    if len(packages) > limit:
+        entries.append(f"+{len(packages) - limit} more")
+    return ", ".join(entries)
 
 
 def restore_modes(log_paths: list[Path]) -> Counter[str]:
@@ -599,7 +755,12 @@ def print_phase(
     results: list[BuildResult],
     wall_seconds: float,
     counts: Counter[str],
+    rustc_seconds: dict[str, float],
+    rustc_package_seconds: dict[str, float],
+    rustc_category_seconds: dict[str, float],
     summary: Counter[str],
+    skip_reasons: Counter[str],
+    skip_packages: dict[str, Counter[str]],
 ) -> None:
     slowest = max(result.seconds for result in results)
     print(f"\n{phase}")
@@ -612,6 +773,19 @@ def print_phase(
     print(f"  parallel wall stretch:     {wall_seconds / slowest:.3f}x")
     print(f"  rustc invocations:         {sum(counts.values())}")
     print(f"  distinct rustc crates:      {len(counts)}")
+    print(f"  rustc process time:         {sum(rustc_seconds.values()):.2f}s")
+    print(
+        "  slowest rustc crates:       "
+        + format_timing_crates(rustc_seconds)
+    )
+    print(
+        "  slowest rustc packages:     "
+        + format_timing_crates(rustc_package_seconds)
+    )
+    print(
+        "  rustc time by category:     "
+        + format_timing_crates(rustc_category_seconds)
+    )
     crate_counts = list(counts.values())
     print(
         "  crates by invocation count: "
@@ -628,6 +802,33 @@ def print_phase(
     hit_rate = summary["hits"] / candidates * 100 if candidates else 0.0
     print(f"  CAS hit rate:              {hit_rate:.1f}%")
     print(f"  duplicate builds avoided:  {summary['duplicate_build_avoidance']}")
+    print_skip_observations(skip_reasons, skip_packages)
+
+
+def format_timing_crates(seconds: dict[str, float], limit: int = 8) -> str:
+    if not seconds:
+        return "none"
+    entries = [
+        f"{crate}={duration:.2f}s"
+        for crate, duration in sorted(seconds.items(), key=lambda item: item[1], reverse=True)[
+            :limit
+        ]
+    ]
+    if len(seconds) > limit:
+        entries.append(f"+{len(seconds) - limit} more")
+    return ", ".join(entries)
+
+
+def print_skip_observations(
+    reasons: Counter[str], packages: dict[str, Counter[str]]
+) -> None:
+    if not reasons:
+        print("  CAS skip units:            none observed in debug events")
+        return
+    print("  CAS skip units by reason:")
+    for reason, count in reasons.most_common():
+        package_text = format_skip_packages(packages.get(reason, Counter()))
+        print(f"    {reason}: {count} ({package_text})")
 
 
 def print_rebuild_series(phase: str, series: RebuildSeries) -> None:
@@ -646,6 +847,19 @@ def print_rebuild_series(phase: str, series: RebuildSeries) -> None:
         print(f"  {result.index:>14}  {format_bytes(result.target_bytes)}")
     print(f"  rustc invocations:         {sum(series.counts.values())}")
     print(f"  distinct rustc crates:      {len(series.counts)}")
+    print(f"  rustc process time:         {sum(series.rustc_seconds.values()):.2f}s")
+    print(
+        "  slowest rustc crates:       "
+        + format_timing_crates(series.rustc_seconds)
+    )
+    print(
+        "  slowest rustc packages:     "
+        + format_timing_crates(series.rustc_package_seconds)
+    )
+    print(
+        "  rustc time by category:     "
+        + format_timing_crates(series.rustc_category_seconds)
+    )
     crate_counts = list(series.counts.values())
     print(
         "  crates by invocation count: "
@@ -666,6 +880,7 @@ def print_rebuild_series(phase: str, series: RebuildSeries) -> None:
         "  duplicate builds avoided:  "
         f"{series.summary['duplicate_build_avoidance']}"
     )
+    print_skip_observations(series.skip_reasons, series.skip_packages)
 
 
 def append_rebuild_marker(
@@ -794,9 +1009,28 @@ def main() -> int:
             env_base=env_base,
             log_root=logs,
         )
-        seed_counts = rustc_counts(rustc_log, seed)
+        (
+            seed_counts,
+            seed_rustc_seconds,
+            seed_rustc_package_seconds,
+            seed_rustc_category_seconds,
+        ) = rustc_timing_summary(rustc_log, seed)
         seed_summary = cas_summaries([result.log_path for result in seed])
-        print_phase("single-worktree cache seed", seed, seed_wall, seed_counts, seed_summary)
+        seed_skip_reasons, seed_skip_packages = cas_skip_observations(
+            [result.log_path for result in seed]
+        )
+        print_phase(
+            "single-worktree cache seed",
+            seed,
+            seed_wall,
+            seed_counts,
+            seed_rustc_seconds,
+            seed_rustc_package_seconds,
+            seed_rustc_category_seconds,
+            seed_summary,
+            seed_skip_reasons,
+            seed_skip_packages,
+        )
         observed_seed_crates = set(seed_counts)
         missing_packages = sorted(
             package
@@ -823,9 +1057,28 @@ def main() -> int:
             env_base=env_base,
             log_root=logs,
         )
-        parallel_counts = rustc_counts(rustc_log, parallel)
+        (
+            parallel_counts,
+            parallel_rustc_seconds,
+            parallel_rustc_package_seconds,
+            parallel_rustc_category_seconds,
+        ) = rustc_timing_summary(rustc_log, parallel)
         parallel_summary = cas_summaries([result.log_path for result in parallel])
-        print_phase("four-worktree parallel cache restore", parallel, parallel_wall, parallel_counts, parallel_summary)
+        parallel_skip_reasons, parallel_skip_packages = cas_skip_observations(
+            [result.log_path for result in parallel]
+        )
+        print_phase(
+            "four-worktree parallel cache restore",
+            parallel,
+            parallel_wall,
+            parallel_counts,
+            parallel_rustc_seconds,
+            parallel_rustc_package_seconds,
+            parallel_rustc_category_seconds,
+            parallel_summary,
+            parallel_skip_reasons,
+            parallel_skip_packages,
+        )
 
         cache_root = home / "cache" / "cargo-cas-v1"
         preserved_cache_entries = cache_entry_names(cache_root)
@@ -933,8 +1186,24 @@ def main() -> int:
             "workspace_packages": sorted(workspace_targets),
             "dev_dependencies": sorted(dev_dependencies),
             "seed_wall_seconds": seed_wall,
+            "seed_rustc_seconds": seed_rustc_seconds,
+            "seed_rustc_package_seconds": seed_rustc_package_seconds,
+            "seed_rustc_category_seconds": seed_rustc_category_seconds,
+            "seed_skip_reasons": dict(seed_skip_reasons),
+            "seed_skip_packages": {
+                reason: dict(packages)
+                for reason, packages in seed_skip_packages.items()
+            },
             "parallel_wall_seconds": parallel_wall,
+            "parallel_rustc_seconds": parallel_rustc_seconds,
+            "parallel_rustc_package_seconds": parallel_rustc_package_seconds,
+            "parallel_rustc_category_seconds": parallel_rustc_category_seconds,
             "parallel_cas": dict(parallel_summary),
+            "parallel_skip_reasons": dict(parallel_skip_reasons),
+            "parallel_skip_packages": {
+                reason: dict(packages)
+                for reason, packages in parallel_skip_packages.items()
+            },
             "parallel_restore_modes": dict(restore_counts),
             "reference_wall_seconds": rebuild_reference.wall_seconds,
             "rebuild_wall_seconds": rebuild.wall_seconds,
@@ -942,6 +1211,14 @@ def main() -> int:
             "rebuild_median_seconds": median(rebuild.wall_seconds),
             "rebuild_multiplier": rebuild_multiplier,
             "rebuild_cas": dict(rebuild.summary),
+            "rebuild_rustc_seconds": rebuild.rustc_seconds,
+            "rebuild_rustc_package_seconds": rebuild.rustc_package_seconds,
+            "rebuild_rustc_category_seconds": rebuild.rustc_category_seconds,
+            "rebuild_skip_reasons": dict(rebuild.skip_reasons),
+            "rebuild_skip_packages": {
+                reason: dict(packages)
+                for reason, packages in rebuild.skip_packages.items()
+            },
             "storage_target_bytes": storage_target_bytes,
             "storage_cache_bytes": storage_cache_bytes,
             "storage_uncached_target_bytes": storage_uncached_bytes,
