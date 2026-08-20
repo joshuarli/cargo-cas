@@ -173,7 +173,11 @@ fn start_gated_check(
     log: &Path,
     release: &Path,
 ) -> Child {
-    let mut cargo = project.cargo("check -Zcargo-cas -vv");
+    // Exercise Cargo's per-unit lock lifecycle together with the CAS action
+    // lock. The latter is acquired only inside active work, after Cargo has
+    // upgraded its own dirty unit lock, so same-key coordination must not turn
+    // unrelated units into a global serialization point.
+    let mut cargo = project.cargo("check -Zcargo-cas -Zfine-grain-locking -vv");
     cargo
         .arg("--target-dir")
         .arg(target_dir)
@@ -181,7 +185,7 @@ fn start_gated_check(
         .env("CAS_TRIGGER_CRATE", trigger_crate)
         .env("CAS_LOG", log)
         .env("CAS_RELEASE", release)
-        .masquerade_as_nightly_cargo(&["cargo-cas"]);
+        .masquerade_as_nightly_cargo(&["cargo-cas", "fine-grain-locking"]);
     cargo
         .build_command()
         .stdout(Stdio::piped())
@@ -199,7 +203,7 @@ fn start_gated_check_in_dir(
     log: &Path,
     release: &Path,
 ) -> Child {
-    let mut cargo = driver.cargo("check -Zcargo-cas -vv");
+    let mut cargo = driver.cargo("check -Zcargo-cas -Zfine-grain-locking -vv");
     cargo
         .cwd(working_dir)
         .arg("--target-dir")
@@ -208,7 +212,7 @@ fn start_gated_check_in_dir(
         .env("CAS_TRIGGER_CRATE", trigger_crate)
         .env("CAS_LOG", log)
         .env("CAS_RELEASE", release)
-        .masquerade_as_nightly_cargo(&["cargo-cas"]);
+        .masquerade_as_nightly_cargo(&["cargo-cas", "fine-grain-locking"]);
     cargo
         .build_command()
         .stdout(Stdio::piped())
