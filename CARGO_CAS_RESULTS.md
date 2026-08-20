@@ -236,9 +236,10 @@ does not erase earlier baselines.
 | `h12tiny` @ `dd20f45` | 4 | 1.069x | 0.971x | pass |
 | `pi-agent-core-rs` @ `8be4329` | 4 | 1.033x | 0.939x | pass; instrumented |
 | `pi-agent-core-rs` @ `8be4329` | 4 | 1.032x | 1.151x | storage pass; timing goal missed |
+| `pi-agent-core-rs` @ `8be4329` | 4 | 1.032x | 0.989x | pass; test-harness telemetry |
 
 The instrumented pi run also records per-`rustc` elapsed time, package, and
-category (`rustc`, build script, or proc macro), plus the package names behind
+category (`rustc`, test harness, build script, or proc macro), plus the package names behind
 each CAS skip reason. In the parallel restore phase, the largest package totals
 were `pi-agent-core` (441.0 s summed across four worktrees), `pi-agent-tui`
 (61.0 s), and `rustls` (60.7 s). Native packages accounted for `ring` (20.9 s)
@@ -247,11 +248,14 @@ work is therefore the local workspace/test targets, not proc-macro or native
 compilation: rebuild rustc time was 1,798.8 s summed across the four worktrees
 and three rounds, versus 24.5 s build-script and 15.0 s proc-macro time.
 
-The latest run adds Git-worktree path identity for local package build units.
-Parallel restore rose from 373/376 hits to 376/376, and wall time fell from
-106.6 s to 88.4 s while the measured footprint stayed at 1.032x. The three
-source-edit rebuild rounds were timing-noisy (reference median 92.0 s, goal
-median 105.9 s, or 1.151x), so the rebuild threshold missed despite unchanged
-540/540 CAS hits and the storage goal passing. Native and proc-macro units remain
-explicitly visible and excluded: parallel `ring`/`mlua-sys` skips total 16 and
-proc-macro skips total 12.
+The prior run added Git-worktree path identity for local package build units:
+parallel restore rose from 373/376 hits to 376/376, and wall time fell from
+106.6 s to 88.4 s while the measured footprint stayed at 1.032x. The latest
+two-round run keeps 376/376 parallel hits, measures 85.5 s parallel wall time,
+and passes the rebuild threshold (reference median 88.6 s, goal median 87.7 s,
+or 0.989x) at the same 1.032x measured footprint. Its telemetry makes the
+remaining cost explicit: parallel test harnesses consumed 430.3 s of summed
+rustc time, versus 231.2 s ordinary rustc, 162.8 s build scripts, and 32.0 s
+proc macros. Native and proc-macro units remain excluded; the safe optimization
+also moves expensive local-source snapshots behind cheap eligibility gates and
+normalizes path-package build-script identities for worktree sharing.

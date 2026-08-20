@@ -20,7 +20,7 @@ is pinned to the revision used by the workspace's ``rust-toolchain.toml``.  Rebu
 with ``CARGO_CAS_REBUILD_ROUNDS``.  Completed runs append one JSON record to
 ``benchmarks/cargo-cas-workspace-history.jsonl`` (override with
 ``CARGO_CAS_RESULTS``), preserving prior project baselines.  The rustc proxy
-also records elapsed time, package, and proc-macro/build-script classification;
+also records elapsed time, package, and test-harness/proc-macro/build-script classification;
 CAS debug events provide the per-unit skip reason and package attribution.
 """
 
@@ -350,6 +350,7 @@ previous=''
 crate='<unknown>'
 package='<unknown>'
 crate_type='<unknown>'
+test_harness=0
 for argument in "$@"; do
     if [ "$previous" = '--crate-name' ]; then
         crate="$argument"
@@ -361,6 +362,9 @@ for argument in "$@"; do
             package='<unknown>'
         fi
     fi
+    if [ "$argument" = '--test' ]; then
+        test_harness=1
+    fi
     previous="$argument"
 done
 start_ns=$(python3 -c 'import time; print(time.time_ns())')
@@ -369,6 +373,9 @@ set +e
 status=$?
 set -e
 end_ns=$(python3 -c 'import time; print(time.time_ns())')
+if [ "$test_harness" -eq 1 ]; then
+    crate_type="${crate_type},test-harness"
+fi
 printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' "$PPID" "$crate" "$package" "$crate_type" "$start_ns" "$end_ns" "$status" \
     >>"$CARGO_CAS_BENCHMARK_RUSTC_LOG"
 exit "$status"
@@ -621,8 +628,10 @@ def rustc_timing_summary(
         seconds = (record.end_ns - record.start_ns) / 1_000_000_000
         crate_seconds[record.crate] = crate_seconds.get(record.crate, 0.0) + seconds
         package_seconds[record.package] = package_seconds.get(record.package, 0.0) + seconds
-        category = "proc-macro" if "proc-macro" in record.crate_type else (
-            "build-script" if record.crate.startswith("build_script_") else "rustc"
+        category = "test-harness" if "test-harness" in record.crate_type else (
+            "proc-macro" if "proc-macro" in record.crate_type else (
+                "build-script" if record.crate.startswith("build_script_") else "rustc"
+            )
         )
         category_seconds[category] = category_seconds.get(category, 0.0) + seconds
     return counts, crate_seconds, package_seconds, category_seconds

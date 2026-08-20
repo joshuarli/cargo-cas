@@ -1151,8 +1151,17 @@ fn build_script_identity(
     let source = package_source_input(unit)?;
     let package_source = serde_json::to_string(&source).ok()?;
     let environment = build_script_environment_input()?;
+    // Path package IDs contain the absolute checkout root. Use the already
+    // serialized immutable source identity instead so replayable build
+    // scripts can be shared by sibling Git worktrees just like compiler
+    // actions. Registry and immutable-Git IDs are already location-stable.
+    let package_id = if unit.pkg.package_id().source_id().is_path() {
+        package_source.clone()
+    } else {
+        unit.pkg.package_id().to_string()
+    };
     Some(BuildScriptIdentity {
-        package_id: unit.pkg.package_id().to_string(),
+        package_id,
         package_source,
         target: unit.target.name().to_owned(),
         host: build_runner.bcx.host_triple().to_string(),
@@ -1495,9 +1504,6 @@ fn ineligibility_reason(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> Opti
     if !source_id.is_path() && !source_id.is_registry() && !source_id.is_git() {
         return Some("source is not an immutable registry or git source");
     }
-    if package_source_input(unit).is_none() {
-        return Some("source lacks an immutable content identity");
-    }
     if unit.is_std {
         return Some("standard library unit");
     }
@@ -1549,6 +1555,14 @@ fn ineligibility_reason(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> Opti
     // their semantics in this cache format.
     if build_runner.bcx.rustc().wrapper.is_some() {
         return Some("rustc wrapper");
+    }
+    // Snapshotting a local package recursively reads every source file and
+    // may inspect Git worktree metadata. Keep that cost behind all cheap
+    // eligibility gates so broad test/example/bin graphs do not hash sources
+    // they could never cache. Action-key construction performs the same
+    // identity check for units that reach the cacheable boundary.
+    if package_source_input(unit).is_none() {
+        return Some("source lacks an immutable content identity");
     }
     None
 }

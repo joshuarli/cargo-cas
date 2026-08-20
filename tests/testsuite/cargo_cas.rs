@@ -787,6 +787,10 @@ version = "0.1.0"
 edition = "2024"
 "#,
         )
+        .file(
+            "local-dependency/build.rs",
+            "fn main() { println!(\"cargo::rerun-if-changed=build.rs\"); }\n",
+        )
         .file("local-dependency/src/lib.rs", "pub fn answer() {}\n")
         .build();
 
@@ -843,6 +847,11 @@ edition = "2024"
     assert!(
         String::from_utf8_lossy(&second_output.stderr).contains("cargo-cas hit"),
         "the worktree-shared path action should report a hit:\n{}",
+        String::from_utf8_lossy(&second_output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&second_output.stderr).contains("hits=2"),
+        "the path package and its replayable build script should both hit across worktrees:\n{}",
         String::from_utf8_lossy(&second_output.stderr)
     );
     run_git(
