@@ -2206,6 +2206,22 @@ fn cache_internal_directories_never_follow_substituted_symlinks() {
         fs::read_dir(&outside).unwrap().next().is_none(),
         "cache staging must not write through a symlink"
     );
+
+    fs::remove_file(&temporary).unwrap();
+    fs::create_dir(&temporary).unwrap();
+    let access = cache.join("access");
+    fs::remove_dir_all(&access).unwrap();
+    symlink(&outside, &access).unwrap();
+    let access_output = run_check(&seed, &paths::root().join("cas-internal-access-target"), "");
+    assert!(
+        !crate_was_compiled(&access_output, LOCK_CRATE),
+        "an unavailable access directory must not discard a valid cache hit:\n{}",
+        String::from_utf8_lossy(&access_output.stderr)
+    );
+    assert!(
+        fs::read_dir(&outside).unwrap().next().is_none(),
+        "last-use tracking must not write through a substituted directory"
+    );
 }
 
 #[cargo_test]
