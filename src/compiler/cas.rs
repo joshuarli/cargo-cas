@@ -6,9 +6,15 @@
 //! module only substitutes the work normally performed by `rustc`.
 
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(target_os = "macos")]
+use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
+use std::os::fd::AsRawFd;
+#[cfg(target_os = "macos")]
+use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
@@ -1187,10 +1193,10 @@ fn build_script_output_is_representable(output: &BuildOutput) -> bool {
 }
 
 /// Capture inherited variables that a build script can observe. Cargo's
-/// target/output-location variables are deliberately omitted because they are
-/// workspace-local and are rewritten during replay; all other UTF-8 values
-/// participate in the action identity so an environment change cannot reuse a
-/// stale script result.
+/// target/output-location variables and Cargo's per-process jobserver value are
+/// deliberately omitted because they are workspace-local or ephemeral and are
+/// rewritten during replay; all other UTF-8 values participate in the action
+/// identity so an environment change cannot reuse a stale script result.
 fn build_script_environment_input() -> Option<BTreeMap<String, String>> {
     std::env::vars_os()
         .filter(|(key, _)| {
@@ -1200,12 +1206,14 @@ fn build_script_environment_input() -> Option<BTreeMap<String, String>> {
                     "CARGO_HOME"
                         | "CARGO_TARGET_DIR"
                         | "CARGO_TARGET_TMPDIR"
+                        | "CARGO_MAKEFLAGS"
                         | "CARGO_LOG"
                         | "RUST_LOG"
                         | "PWD"
                         | "OLDPWD"
                         | "SHLVL"
                         | "_"
+                        | "OUT_DIR"
                 )
             )
         })
@@ -2150,10 +2158,11 @@ fn open_regular_file(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
-/// Copies an entry artifact through a no-follow descriptor and proves that the
-/// bytes observed at restore time are still the manifest bytes validated at
-/// lookup time. This closes the validation-to-copy window for a locally
-/// substituted cache artifact.
+/// Restores an entry artifact through a no-follow descriptor and proves that
+/// the bytes observed at restore time are still the manifest bytes validated at
+/// lookup time. macOS first uses its copy-on-write clone primitive so each
+/// worktree shares immutable cache blocks; other filesystems use the streaming
+/// copy fallback. A clone never shares a mutable inode with Cargo's target.
 fn copy_verified_artifact(
     source: &Path,
     destination: &Path,
@@ -2161,6 +2170,22 @@ fn copy_verified_artifact(
     expected_digest: &str,
 ) -> io::Result<()> {
     let mut source = open_regular_file(source)?;
+
+    if fs::symlink_metadata(destination).is_ok() {
+        fs::remove_file(destination)?;
+    }
+    if try_clone_from_open_file(&source, destination)? {
+        if verify_artifact(destination, expected_size, expected_digest).is_ok() {
+            debug!("cargo-cas restore: copy-on-write clone");
+            return Ok(());
+        }
+        let _ = fs::remove_file(destination);
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cargo-cas artifact changed after manifest validation",
+        ));
+    }
+
     let mut destination = OpenOptions::new()
         .write(true)
         .create(true)
@@ -2179,7 +2204,52 @@ fn copy_verified_artifact(
         size = size.saturating_add(count as u64);
     }
     destination.flush()?;
+    debug!("cargo-cas restore: streaming copy fallback");
     if size != expected_size || digest.finalize().to_hex().as_str() != expected_digest {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cargo-cas artifact changed after manifest validation",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn try_clone_from_open_file(source: &File, destination: &Path) -> io::Result<bool> {
+    let destination = CString::new(destination.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    let result = unsafe {
+        libc::fclonefileat(
+            source.as_raw_fd(),
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            0,
+        )
+    };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ENOTSUP | libc::EEXIST | libc::EXDEV) => Ok(false),
+        _ => Err(error),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn try_clone_from_open_file(_source: &File, _destination: &Path) -> io::Result<bool> {
+    Ok(false)
+}
+
+fn verify_artifact(path: &Path, expected_size: u64, expected_digest: &str) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() || metadata.len() != expected_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cargo-cas artifact changed after manifest validation",
+        ));
+    }
+    if digest_file(path)? != expected_digest {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "cargo-cas artifact changed after manifest validation",

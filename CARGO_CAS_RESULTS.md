@@ -211,3 +211,24 @@ is handled by rejecting any encoded dep-info absolute path, not remapping it.
 `cargo clean` intentionally leaves immutable global entries alone; a hit
 re-materializes local state. Metadata pipelining is preserved only for the
 current rmeta/linkable artifact contract.
+
+## Four-worktree workspace history
+
+The repeatable workspace benchmark is [`scripts/benchmark-ish-cas.py`](scripts/benchmark-ish-cas.py).
+It uses the release `cargo-cas` binary, while the measured workspace command is
+an explicit debug build:
+
+```text
+cargo test -Zcargo-cas --workspace --all-targets --all-features --no-run --profile dev --locked
+```
+
+Every completed run appends a machine-readable record to
+[`benchmarks/cargo-cas-workspace-history.jsonl`](benchmarks/cargo-cas-workspace-history.jsonl).
+The history is append-only so changing the active project or tightening a goal
+does not erase earlier baselines.
+
+| Workspace | Worktrees | Measured footprint | Rebuild multiplier | Result |
+| --- | ---: | ---: | ---: | --- |
+| `ish` (historical) | 4 | 1.235x | 1.018x | pass |
+| `pi-agent-core-rs` (historical) | 4 | 1.044x | 1.108x | storage pass; rebuild goal missed |
+| `h12tiny` @ `dd20f45` | 4 | 1.069x | 0.971x | pass |

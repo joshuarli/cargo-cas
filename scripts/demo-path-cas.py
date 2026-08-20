@@ -265,7 +265,7 @@ def main() -> int:
 
     epsh = env_path("EPSH_DIR", Path.home() / "d" / "epsh")
     ish = env_path("ISH_DIR", Path.home() / "d" / "ish")
-    cargo_cas = env_path("CARGO_CAS_BIN", REPO_ROOT / "target" / "debug" / "cargo")
+    cargo_cas = env_path("CARGO_CAS_BIN", REPO_ROOT / "target" / "release" / "cargo")
     global_registry = env_path("CARGO_CAS_REGISTRY", Path.home() / ".cargo" / "registry")
     toolchain = os.environ.get("CARGO_CAS_DEMO_TOOLCHAIN", DEFAULT_TOOLCHAIN)
     regular_cargo = resolve_tool(toolchain, "cargo")
@@ -275,6 +275,8 @@ def main() -> int:
     for label, path in (("epsh", epsh), ("ish", ish), ("cargo-cas", cargo_cas)):
         if not path.exists():
             raise DemoError(f"{label} not found: {path}")
+    if cargo_cas.parent.name != "release":
+        raise DemoError(f"cargo-cas path demo requires a release binary, got: {cargo_cas}")
     if not global_registry.is_dir():
         raise DemoError(f"registry source cache not found: {global_registry}")
 
