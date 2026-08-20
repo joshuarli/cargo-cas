@@ -516,9 +516,14 @@ edition = "2024"
     );
 
     for (label, config) in [
+        ("opt-level", "profile.dev.opt-level=1"),
         ("debug", "profile.dev.debug=0"),
+        ("debug-assertions", "profile.dev.debug-assertions=false"),
+        ("overflow-checks", "profile.dev.overflow-checks=false"),
         ("panic", r#"profile.dev.panic="abort""#),
+        ("lto", "profile.dev.lto=true"),
         ("codegen", "profile.dev.codegen-units=1"),
+        ("split-debuginfo", r#"profile.dev.split-debuginfo="packed""#),
     ] {
         let output = run_check_with_config(
             &project,
@@ -531,6 +536,22 @@ edition = "2024"
             String::from_utf8_lossy(&output.stderr)
         );
     }
+
+    // This changes a rustc diagnostic argument without changing the package
+    // source, profile, or RUSTFLAGS. It must still not reuse an entry made
+    // without `-Zcargo-lints`: an ActionKey represents the compiler action,
+    // not merely the emitted rmeta bytes in this particular fixture.
+    let mut cargo_lints = project.cargo("check -Zcargo-cas -Zcargo-lints -vv");
+    cargo_lints
+        .arg("--target-dir")
+        .arg(paths::root().join("cas-key-configuration-cargo-lints-target"))
+        .masquerade_as_nightly_cargo(&["cargo-cas", "cargo-lints"]);
+    let cargo_lints_output = cargo_lints.run();
+    assert!(
+        crate_was_compiled(&cargo_lints_output, CRATE),
+        "-Zcargo-lints must select a distinct compiler action:\n{}",
+        String::from_utf8_lossy(&cargo_lints_output.stderr)
+    );
 
     // V1 shares only host units. Even an explicit request for the compiler's
     // native target uses Cargo's target compilation role and must fall back to

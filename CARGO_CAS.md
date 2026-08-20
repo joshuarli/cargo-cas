@@ -584,6 +584,17 @@ unchanged version banner while changing code generation, and a sysroot can
 provide compilation inputs not represented in that banner. The corresponding
 regression test uses two such shims and requires a cache miss.
 
+`CacheKeyInputV0` also records an explicit compiler-contract section for the
+effective pieces of `prepare_rustc` that are not covered by `Profile`, unit
+`rustflags`, or the dependency ActionKey DAG: manifest lint flags, generated
+`--check-cfg` arguments, the effective cap-lints mode, `-Zallow-features`,
+`-Zcargo-lints`, binary-dependency dep-info and checksum-freshness switches,
+metadata embedding, and the selected linker path. This avoids treating a
+matching artifact filename as proof that the preceding compiler action was
+the same. The regression matrix changes opt level, debug/debug-assertion and
+overflow settings, panic, LTO, codegen units, split debuginfo, effective Cargo
+`build.rustflags`, encoded Rustflags, and `-Zcargo-lints` independently.
+
 ## Gate 1 observed relocation contract
 
 `tests/testsuite/gate1_relocatability.rs` compiles the same local-registry

@@ -163,8 +163,27 @@ struct CacheKeyInputV0<'a> {
     toolchain: ToolchainInput,
     rustflags: &'a [String],
     extra_args: &'a [String],
+    compiler_contract: CompilerContractInput,
     features: Vec<String>,
     dependencies: Vec<DependencyInput>,
+}
+
+/// The remaining stable portion of Cargo's rustc invocation which is not
+/// already represented by [`Profile`], `Unit::rustflags`, or dependency
+/// ActionKeys.  Keeping this separate makes the cache-key audit searchable:
+/// adding an effective compiler argument requires either an explicit field
+/// here or a conservative eligibility exclusion.
+#[derive(Serialize)]
+struct CompilerContractInput {
+    manifest_lint_rustflags: Vec<String>,
+    check_cfg_args: Vec<String>,
+    cap_lints: &'static str,
+    allow_features: Vec<String>,
+    cargo_lints: bool,
+    binary_dep_depinfo: bool,
+    checksum_freshness: bool,
+    embeds_metadata: bool,
+    linker: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -688,6 +707,7 @@ fn action_key_inner(
         .map(Vec::as_slice)
         .unwrap_or_default();
     let toolchain = toolchain_input(build_runner)?;
+    let compiler_contract = compiler_contract_input(build_runner, unit)?;
     let input = CacheKeyInputV0 {
         format_version: CACHE_FORMAT_VERSION,
         package: PackageInput {
@@ -717,6 +737,7 @@ fn action_key_inner(
         toolchain,
         rustflags: &unit.rustflags,
         extra_args,
+        compiler_contract,
         features: unit
             .features
             .iter()
@@ -726,6 +747,64 @@ fn action_key_inner(
     };
     let bytes = serde_json::to_vec(&input).ok()?;
     Some(ActionKey(blake3::hash(&bytes).to_hex().to_string()))
+}
+
+/// Captures every effective compiler setting that V0 can represent without
+/// serializing workspace-local paths.  The caller has already limited V0 to
+/// native-host pure-Rust libraries, so the selected linker is still recorded
+/// as a strict identity even though ordinary rlib/rmeta compilation normally
+/// does not invoke it.
+fn compiler_contract_input(
+    build_runner: &BuildRunner<'_, '_>,
+    unit: &Unit,
+) -> Option<CompilerContractInput> {
+    let gctx = build_runner.bcx.gctx;
+    let linker_path = if unit.target.for_host() && !gctx.target_applies_to_host().ok()? {
+        build_runner.compilation.host_linker()
+    } else {
+        build_runner.compilation.target_linker(unit.kind)
+    };
+    let linker = match linker_path {
+        Some(path) => Some(path.to_str()?.to_owned()),
+        None => None,
+    };
+    let allow_features = gctx
+        .cli_unstable()
+        .allow_features
+        .as_ref()
+        .map(|features| features.iter().map(ToString::to_string).collect())
+        .unwrap_or_default();
+    let check_cfg_args = super::check_cfg_args(unit)
+        .into_iter()
+        .map(|argument| argument.into_string().ok())
+        .collect::<Option<Vec<_>>>()?;
+    Some(CompilerContractInput {
+        manifest_lint_rustflags: unit
+            .pkg
+            .manifest()
+            .lint_rustflags()
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        check_cfg_args,
+        // Registry and immutable-git packages are never local V0 units, so
+        // this exactly matches `compute_cap_lints` in `compiler::mod`.
+        cap_lints: if unit.show_warnings(gctx) {
+            "warn"
+        } else {
+            "allow"
+        },
+        allow_features,
+        cargo_lints: gctx.cli_unstable().cargo_lints,
+        binary_dep_depinfo: gctx.cli_unstable().binary_dep_depinfo,
+        checksum_freshness: gctx.cli_unstable().checksum_freshness,
+        embeds_metadata: build_runner
+            .bcx
+            .target_data
+            .info(unit.kind)
+            .should_embed_metadata(),
+        linker,
+    })
 }
 
 fn manifest_identity(
