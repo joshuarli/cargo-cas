@@ -33,6 +33,10 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 real_rustc=$(command -v rustc)
+if ! command -v lsof >/dev/null 2>&1; then
+    echo "cargo-cas scaling benchmark requires macOS lsof" >&2
+    exit 1
+fi
 rustc_log="$work_root/rustc.log"
 rustc_proxy="$work_root/counting-rustc"
 cat >"$rustc_proxy" <<'EOF'
@@ -41,6 +45,11 @@ previous=''
 for argument in "$@"; do
     if [ "$previous" = '--crate-name' ]; then
         printf '%s %s\n' "$CAS_BENCHMARK_LABEL" "$argument" >>"$CAS_BENCHMARK_RUSTC_LOG"
+        case "${CAS_BENCHMARK_HOLD_SCALE:-0}:$argument" in
+            1:cas_scale_*)
+                while [ ! -f "$CAS_BENCHMARK_RELEASE_FILE" ]; do sleep 0.02; done
+                ;;
+        esac
         break
     fi
     previous="$argument"
@@ -151,6 +160,7 @@ read_metric() {
     kind=$2
     case "$kind" in
         dependency) count_dependency_rustc "$label" ;;
+        scale) grep -c "^$label cas_scale_" "$rustc_log" || true ;;
         total) count_total_rustc "$label" ;;
         seconds) cat "$work_root/$label.seconds" ;;
     esac
@@ -224,6 +234,8 @@ run_concurrent 2 cas
 run_concurrent 4 cas
 run_concurrent 8 cas
 
+# Keep the baseline storage comparison separate from the deliberately large
+# lock-scaling graph below; they answer different questions.
 cache_root="$cas_home/cache/cargo-cas-v1"
 cache_bytes=$(directory_bytes "$cache_root")
 upstream_workspace_bytes=0
@@ -236,6 +248,83 @@ for target_dir in "$work_root"/cas-*-target "$work_root"/cas-concurrent-*-target
     [ -d "$target_dir" ] || continue
     cas_workspace_bytes=$((cas_workspace_bytes + $(directory_bytes "$target_dir")))
 done
+
+scaling_actions=${CARGO_CAS_SCALE_ACTIONS:-64}
+scaling_jobs=${CARGO_CAS_SCALE_JOBS:-8}
+scaling_workspace="$work_root/cas-scaling"
+scaling_target="$work_root/cas-scaling-target"
+scaling_release="$work_root/cas-scaling.release"
+mkdir -p "$scaling_workspace/src"
+cat >"$scaling_workspace/Cargo.toml" <<EOF
+[package]
+name = "cas-scaling-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+EOF
+printf 'fn main() {}\n' >"$scaling_workspace/src/main.rs"
+index=1
+while [ "$index" -le "$scaling_actions" ]; do
+    dependency="$work_root/cas-scaling-dependency-$index"
+    package_name="cas-scale-$index"
+    mkdir -p "$dependency/src"
+    cat >"$dependency/Cargo.toml" <<EOF
+[package]
+name = "$package_name"
+version = "1.0.0"
+edition = "2024"
+EOF
+    printf 'pub const VALUE: usize = %s;\n' "$index" >"$dependency/src/lib.rs"
+    git -C "$dependency" init -q
+    git -C "$dependency" config user.email cargo-cas-benchmark@example.invalid
+    git -C "$dependency" config user.name cargo-cas-benchmark
+    git -C "$dependency" add Cargo.toml src/lib.rs
+    git -C "$dependency" commit -qm initial
+    revision=$(git -C "$dependency" rev-parse HEAD)
+    printf '%s = { git = "file://%s", rev = "%s" }\n' \
+        "$package_name" "$dependency" "$revision" >>"$scaling_workspace/Cargo.toml"
+    index=$((index + 1))
+done
+
+# `CacheAction::coordinate` owns a lock only while a unit's job is active.
+# Pause every independent dependency rustc after it has acquired its key lock,
+# then inspect the Cargo process.  The open lock-descriptor count must be
+# bounded by Cargo's `-j` setting, not the 64-node graph size.
+scaling_started=$(date +%s)
+(
+    cd "$scaling_workspace"
+    exec env CARGO_HOME="$cas_home" RUSTC="$rustc_proxy" CAS_BENCHMARK_LABEL=cas-scaling \
+        CAS_BENCHMARK_HOLD_SCALE=1 CAS_BENCHMARK_RELEASE_FILE="$scaling_release" \
+        "$cas_bin" check -Zcargo-cas -vv -j "$scaling_jobs" --target-dir "$scaling_target"
+) >"$work_root/cas-scaling.log" 2>&1 &
+scaling_pid=$!
+scaling_deadline=$(( $(date +%s) + 60 ))
+while [ "$(grep -c '^cas-scaling cas_scale_' "$rustc_log" 2>/dev/null || true)" -lt "$scaling_jobs" ]; do
+    if [ "$(date +%s)" -ge "$scaling_deadline" ]; then
+        : >"$scaling_release"
+        wait "$scaling_pid" || true
+        echo "cargo-cas scaling benchmark did not start $scaling_jobs independent actions" >&2
+        exit 1
+    fi
+    sleep 0.02
+done
+scaling_lock_directory=$(cd "$cas_home/cache/cargo-cas-v1/locks" && pwd -P)
+scaling_lock_fds=$(lsof -p "$scaling_pid" -Fn 2>/dev/null \
+    | awk -v cache="$scaling_lock_directory/" \
+        'index($0, cache) == 2 { count += 1 } END { print count + 0 }')
+if [ "$scaling_lock_fds" -gt "$scaling_jobs" ]; then
+    : >"$scaling_release"
+    wait "$scaling_pid" || true
+    echo "cargo-cas held $scaling_lock_fds locks for a $scaling_jobs-job build" >&2
+    exit 1
+fi
+: >"$scaling_release"
+wait "$scaling_pid"
+elapsed_seconds "$scaling_started" >"$work_root/cas-scaling.seconds"
+
+scaling_cache_bytes=$(($(directory_bytes "$cache_root") - cache_bytes))
+scaling_workspace_bytes=$(directory_bytes "$scaling_target")
 
 cat <<EOF
 cargo-cas benchmark complete
@@ -254,8 +343,13 @@ cargo-cas unrelated         $(read_metric cas-unrelated-warm dependency) $(read_
 cargo-cas concurrent 2      $(read_metric cas-concurrent-2 dependency) $(read_metric cas-concurrent-2 total) $(read_metric cas-concurrent-2 seconds)
 cargo-cas concurrent 4      $(read_metric cas-concurrent-4 dependency) $(read_metric cas-concurrent-4 total) $(read_metric cas-concurrent-4 seconds)
 cargo-cas concurrent 8      $(read_metric cas-concurrent-8 dependency) $(read_metric cas-concurrent-8 total) $(read_metric cas-concurrent-8 seconds)
+cargo-cas scale $scaling_actions       $(read_metric cas-scaling scale) $(read_metric cas-scaling total) $(read_metric cas-scaling seconds)
 
 cache bytes:                $cache_bytes
 upstream workspace bytes:   $upstream_workspace_bytes
 cargo-cas workspace bytes:  $cas_workspace_bytes
+scale jobs:                 $scaling_jobs
+peak cargo-cas lock fds:    $scaling_lock_fds
+scale cache bytes:          $scaling_cache_bytes
+scale workspace bytes:      $scaling_workspace_bytes
 EOF

@@ -443,6 +443,15 @@ barrier. The global cache needs an additional per-ActionKey coordination and
 publication protocol; the existing unit lock protects only each workspace's
 materialized build-unit directory.
 
+`src/compiler/cas.rs::CacheAction::coordinate` intentionally opens its
+ActionKey lock only inside active `Work` and drops it as the work closure
+returns. The cache action itself owns no descriptor while Cargo constructs the
+unit graph. Consequently live CAS lock descriptors are bounded by Cargo's
+active job count, rather than the number of units. The reproducible macOS
+64-action benchmark in `scripts/benchmark-cas.sh` pauses active dependency
+compilers and verifies this directly with `lsof`: 64 ActionKeys at `-j 8`
+produce eight live cache lock descriptors.
+
 ## Artifact outputs and uplift
 
 `CompilationFiles::calc_outputs_rustc` turns target information into

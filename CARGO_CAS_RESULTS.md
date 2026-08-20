@@ -32,18 +32,18 @@ rounded wall time—are the meaningful result.
 
 | Scenario | Shared dependency rustc | Total rustc | Wall time |
 | --- | ---: | ---: | ---: |
-| Upstream cold | 1 | 3 | 1 s |
+| Upstream cold | 1 | 3 | 0 s |
 | Upstream same workspace warm | 0 | 0 | 0 s |
-| Upstream unrelated workspace warm | 1 | 3 | 0 s |
-| Upstream concurrent 2 | 2 | 6 | 1 s |
+| Upstream unrelated workspace warm | 1 | 3 | 1 s |
+| Upstream concurrent 2 | 2 | 6 | 0 s |
 | Upstream concurrent 4 | 4 | 12 | 1 s |
 | Upstream concurrent 8 | 8 | 24 | 2 s |
-| cargo-cas cold | 1 | 3 | 1 s |
+| cargo-cas cold | 1 | 3 | 0 s |
 | cargo-cas same workspace warm | 0 | 0 | 0 s |
-| cargo-cas unrelated workspace warm | 0 | 2 | 1 s |
-| cargo-cas concurrent 2 | 1 | 5 | 1 s |
+| cargo-cas unrelated workspace warm | 0 | 2 | 0 s |
+| cargo-cas concurrent 2 | 1 | 5 | 0 s |
 | cargo-cas concurrent 4 | 1 | 9 | 1 s |
-| cargo-cas concurrent 8 | 1 | 17 | 3 s |
+| cargo-cas concurrent 8 | 1 | 17 | 2 s |
 
 The decisive comparisons are the unrelated workspace (one avoided shared
 compile) and the 2/4/8 worktree cohorts (1 shared compile instead of 2/4/8).
@@ -64,6 +64,17 @@ sanity check on the intended ownership boundary, not a claim of large
 real-world disk savings. CPU time was not recorded because the synthetic run is
 below the timer's useful resolution.
 
+### Lock-scaling check
+
+The benchmark also creates 64 independent immutable Git packages and pauses
+their first `rustc` invocations after their CAS locks have been acquired. With
+`-j 8`, it observed 64 dependency `rustc` processes (66 total), 6 s wall time,
+and **8** open CAS lock descriptors. The graph therefore has 64 ActionKeys but
+the live lock count is bounded by Cargo's job concurrency, not graph size. This
+additive stress graph occupied 786,432 cache bytes and 1,634,304 local-target
+bytes; it is deliberately excluded from the equivalent-workspace storage table
+above.
+
 ### Reproduce
 
 ```sh
@@ -78,7 +89,10 @@ CARGO_UPSTREAM_BIN=/tmp/cargo-upstream/target/release/cargo \
 ```
 
 Set `CARGO_CAS_BENCHMARK_KEEP=1` to retain the isolated inputs, target
-directories, logs, and counters for inspection.
+directories, logs, and counters for inspection. The default includes the
+64-action lock-scaling check; set `CARGO_CAS_SCALE_ACTIONS` and
+`CARGO_CAS_SCALE_JOBS` to adjust it. This macOS-only check uses `lsof` to count
+the Cargo process's live `cargo-cas-v1/locks` descriptors.
 
 ## Real-world cacheability experiment
 
