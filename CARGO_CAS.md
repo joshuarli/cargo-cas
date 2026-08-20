@@ -620,6 +620,16 @@ work, same-key duplicate-build avoidance, and a reason-counted skip map. The
 summary is process-local observability, not mutable entry metadata; cache
 entries remain immutable after publication.
 
+## Pipelined cache hits
+
+`artifact_paths` orders an eligible cache entry as `.rmeta`, linkable artifact,
+then translated dep-info. `CacheAction::restore_or_compile` copies that
+metadata role first and calls `JobState::rmeta_produced` immediately after it
+is materialized. A metadata-only dependent can therefore use the normal Cargo
+pipeline edge without waiting for linkable-artifact or local-bookkeeping
+transport. The Gate 3 manifest regression asserts this role order alongside
+the normal build/artifact-dir behavior.
+
 ## Exact archaeology commands and checks
 
 The following read-only commands were used for this document:

@@ -1047,6 +1047,18 @@ edition = "2024"
     assert!(manifest_text.contains("\"rmeta\""));
     assert!(manifest_text.contains("\"linkable\""));
     assert!(manifest_text.contains(".rlib"));
+    let manifest_json: serde_json::Value = serde_json::from_str(&manifest_text).unwrap();
+    let roles = manifest_json["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|artifact| artifact["role"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        roles,
+        ["rmeta", "linkable", "dep-info"],
+        "a cache hit must restore metadata before linkable and local bookkeeping files"
+    );
 
     let second_target = paths::root().join("cas-build-second-target");
     let second_output = run_build(&second, &second_target);

@@ -408,7 +408,6 @@ impl CacheAction {
         let stats = self.stats.clone();
 
         Work::new(move |state| {
-            let mut restored_rmeta = false;
             let restored: CargoResult<()> = (|| {
                 for (source, destination, role) in restores {
                     let parent = destination.parent().expect("Cargo output path has parent");
@@ -418,18 +417,17 @@ impl CacheAction {
                     // mutate a globally cached inode.
                     fs::copy(source, destination)?;
                     if role == ArtifactRole::Rmeta {
-                        restored_rmeta = true;
+                        // Pipelined metadata consumers can begin as soon as
+                        // the restored `.rmeta` is locally available. The
+                        // manifest always places this role before the
+                        // linkable artifact and dep-info transport files.
+                        state.rmeta_produced();
                     }
                 }
                 Ok(())
             })();
             match restored {
-                Ok(()) => {
-                    if restored_rmeta {
-                        state.rmeta_produced();
-                    }
-                    Ok(())
-                }
+                Ok(()) => Ok(()),
                 Err(error) => {
                     warn!(error = ?error, "cargo-cas entry disappeared during restore; compiling normally");
                     stats.eligible_rustc();
@@ -926,6 +924,14 @@ fn artifact_paths(
         role: ArtifactRole::DepInfo,
         source: dep_info.clone(),
         destination: dep_info,
+    });
+    // The scheduler may unblock a metadata-only dependent as soon as its
+    // `.rmeta` has been restored. Keep that role first; Cargo bookkeeping can
+    // follow without delaying the pipeline edge.
+    artifacts.sort_unstable_by_key(|artifact| match artifact.role {
+        ArtifactRole::Rmeta => 0,
+        ArtifactRole::Linkable => 1,
+        ArtifactRole::DepInfo => 2,
     });
     Ok(artifacts)
 }
