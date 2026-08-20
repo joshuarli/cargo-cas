@@ -13,7 +13,7 @@ use crate::utils::cargo_process;
 use cargo_test_support::install::assert_has_installed_exe;
 use cargo_test_support::paths::{cargo_home, home, root};
 use cargo_test_support::registry::Package;
-use cargo_test_support::{execs, process, project, str};
+use cargo_test_support::{execs, process, project, project_in, str};
 
 /// Helper to generate an executable.
 fn make_exe(dest: &Path, name: &str, contents: &str, env: &[(&str, PathBuf)]) -> PathBuf {
@@ -41,6 +41,20 @@ fn prepend_path(path: &Path) -> OsString {
     let mut paths = vec![path.to_path_buf()];
     paths.extend(env::split_paths(&env::var_os("PATH").unwrap_or_default()));
     env::join_paths(paths).unwrap()
+}
+
+/// Writes an executable shell proxy for the simulated rustup installation.
+fn write_executable_script(path: &Path, contents: &str) -> PathBuf {
+    fs::write(path, contents).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+    path.to_owned()
 }
 
 struct RustupEnvironment {
@@ -254,6 +268,118 @@ real rustc running
 
 "#]])
         .run();
+}
+
+// This doesn't work on Windows because Cargo forces the PATH to contain the
+// sysroot_libdir, which prevents the test from overriding the rustup proxy.
+#[cargo_test(ignore_windows = "PATH can't be overridden on Windows")]
+fn direct_cargo_uses_project_toolchain_for_dependency_rustc() {
+    // A direct Cargo binary does not receive rustup's `RUSTUP_TOOLCHAIN`
+    // environment variable. The proxy must therefore be resolved once, from
+    // Cargo's project cwd, before Cargo starts compiling packages whose cwd is
+    // outside the project (such as this path dependency).
+    let dependency = project_in("direct-rustup-toolchain-dep")
+        .file(
+            "Cargo.toml",
+            r#"[package]
+name = "direct-rustup-toolchain-dep"
+version = "0.0.1"
+edition = "2021"
+"#,
+        )
+        .file("src/lib.rs", "pub fn answer() -> usize { 1 }\n")
+        .build();
+    let project_manifest = format!(
+        r#"[package]
+name = "direct-rustup-toolchain"
+version = "0.0.1"
+edition = "2021"
+
+[dependencies]
+direct-rustup-toolchain-dep = {{ path = "{}" }}
+"#,
+        dependency.root().display()
+    );
+    let project = project_in("direct-rustup-toolchain")
+        .file(
+            "rust-toolchain.toml",
+            "[toolchain]\nchannel = \"test-toolchain\"\n",
+        )
+        .file("Cargo.toml", &project_manifest)
+        .file(
+            "src/main.rs",
+            "fn main() { assert_eq!(direct_rustup_toolchain_dep::answer(), 1); }\n",
+        )
+        .build();
+
+    let fake_bin = root().join("direct-rustup-toolchain-bin");
+    fake_bin.mkdir_p();
+    let selection_log = root().join("direct-rustup-toolchain-selection.log");
+    let real_rustc = PathBuf::from(
+        String::from_utf8(
+            std::process::Command::new("rustup")
+                .args(["which", "rustc"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim(),
+    );
+    let selected = fake_bin.join("selected-rustc");
+    write_executable_script(
+        &selected,
+        r#"#!/bin/sh
+echo selected >> "$CARGO_RUSTUP_TEST_selection_log"
+exec "$CARGO_RUSTUP_TEST_real_rustc" "$@"
+"#,
+    );
+    write_executable_script(
+        &fake_bin.join("rustc"),
+        r#"#!/bin/sh
+# rustup proxy
+case "$PWD/" in
+  "$CARGO_RUSTUP_TEST_project_root"/*) echo project >> "$CARGO_RUSTUP_TEST_selection_log" ;;
+  *) echo default >> "$CARGO_RUSTUP_TEST_selection_log" ;;
+esac
+exec "$CARGO_RUSTUP_TEST_real_rustc" "$@"
+"#,
+    );
+    write_executable_script(
+        &fake_bin.join("rustup"),
+        r#"#!/bin/sh
+# rustup proxy
+if [ "$1" = which ] && [ "$2" = rustc ]; then
+  echo "$CARGO_RUSTUP_TEST_selected_rustc"
+  exit 0
+fi
+exit 1
+"#,
+    );
+
+    let path = prepend_path(&fake_bin);
+    project
+        .cargo("check -vv")
+        .env("PATH", path)
+        .env("CARGO_RUSTUP_TEST_project_root", project.root())
+        .env("CARGO_RUSTUP_TEST_selection_log", &selection_log)
+        .env("CARGO_RUSTUP_TEST_real_rustc", &real_rustc)
+        .env("CARGO_RUSTUP_TEST_selected_rustc", &selected)
+        .env_remove("RUSTC")
+        .env_remove("RUSTUP_HOME")
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .env_remove("RUSTUP_TOOLCHAIN_SOURCE")
+        .run();
+
+    let selection = fs::read_to_string(selection_log).unwrap();
+    assert!(
+        !selection.lines().any(|line| line == "default"),
+        "dependency rustc must use the project-selected toolchain, got:\n{selection}"
+    );
+    assert!(
+        selection.lines().any(|line| line == "selected"),
+        "Cargo must invoke the absolute compiler selected by rustup, got:\n{selection}"
+    );
 }
 
 // This doesn't work on Windows because Cargo forces the PATH to contain the

@@ -33,11 +33,11 @@ use crate::util::CargoResult;
 use crate::workspace::{PackageId, Target};
 use cargo_util_schemas::manifest::RustVersion;
 
-// Version 4 adds a stable identity for local packages checked out as Git
-// worktrees. Entries from older formats cannot prove that a path dependency
-// still has the same source snapshot or worktree identity, so they must be
-// rebuilt rather than accepted as a partial hit.
-const CACHE_FORMAT_VERSION: u8 = 4;
+// Version 5 records entries after resolving rustup proxies from Cargo's
+// invocation directory. Older entries may have been compiled by a different
+// rustup override after Cargo changed each child process's cwd, so they must
+// be rebuilt rather than accepted as a partial hit.
+const CACHE_FORMAT_VERSION: u8 = 5;
 const CACHE_DIRECTORY: &str = "cargo-cas-v1";
 const MANIFEST_FILE: &str = "manifest.json";
 const ARTIFACTS_DIRECTORY: &str = "artifacts";

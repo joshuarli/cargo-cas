@@ -492,7 +492,7 @@ pub fn answer() -> u32 { 41 }
     let manifest = cache_manifest();
     let manifest_json: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&manifest).unwrap()).unwrap();
-    assert_eq!(manifest_json["format_version"], 4);
+    assert_eq!(manifest_json["format_version"], 5);
     assert_eq!(manifest_json["identity"]["target_name"], REGISTRY_CRATE);
     assert_eq!(manifest_json["identity"]["compile_mode"], "check");
     assert!(manifest_json["identity"]["package_id"].is_string());
@@ -535,7 +535,7 @@ pub fn answer() -> u32 { 41 }
     );
     let rebuilt_manifest: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&manifest).unwrap()).unwrap();
-    assert_eq!(rebuilt_manifest["format_version"], 4);
+    assert_eq!(rebuilt_manifest["format_version"], 5);
 
     let exact_output = run_check(&exact, &paths::root().join("cas-exact-target"), "");
     assert!(
@@ -968,7 +968,7 @@ pub fn noop(_input: TokenStream) -> TokenStream { TokenStream::new() }
     let build_script_manifest = build_script_cache_manifest(BUILD_SCRIPT_PACKAGE);
     let build_script_manifest_json: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(build_script_manifest).unwrap()).unwrap();
-    assert_eq!(build_script_manifest_json["format_version"], 4);
+    assert_eq!(build_script_manifest_json["format_version"], 5);
     assert_eq!(build_script_manifest_json["files"].as_array().unwrap().len(), 1);
     assert!(build_script_manifest_json["output"]
         .as_str()

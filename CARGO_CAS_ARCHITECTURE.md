@@ -250,6 +250,13 @@ from the global entry.
 The relocatability evidence is macOS-only and does not claim cross-OS,
 cross-target, network-filesystem, or arbitrary debug/path metadata reuse.
 
+When Cargo is launched directly instead of through rustup's Cargo proxy, the
+compiler path is resolved once with `rustup which rustc` from Cargo's
+invocation directory. This preserves the project `rust-toolchain.toml`
+override even though individual rustc child processes run with package-local
+working directories. The resolved absolute path is part of the action identity;
+an explicit `RUSTC` or `build.rustc` setting remains authoritative.
+
 ## Storage and manifest format
 
 Entries live below:
@@ -265,7 +272,7 @@ $CARGO_HOME/cache/cargo-cas-v1/
     access/<action-key>              # mutable last-use record
 ```
 
-The current on-disk `CACHE_FORMAT_VERSION` is **4**. The directory name is
+The current on-disk `CACHE_FORMAT_VERSION` is **5**. The directory name is
 kept at `cargo-cas-v1`; the manifest version is the compatibility boundary.
 Compiler manifests contain the action key, a duplicate human-readable
 identity, and artifact records. Each record has a role (`rmeta`, `linkable`,
@@ -368,7 +375,9 @@ eligibility.
 
 The cache directory remains `cargo-cas-v1`, while incompatible manifest
 changes advance the format number. Earlier notes refer to formats 2 and 3;
-those entries are intentionally rejected by the current format-4 reader.
+those entries are intentionally rejected by the current format-5 reader. The
+format-5 boundary also invalidates entries produced before direct Cargo
+invocations resolved rustup's project override once at startup.
 The current format includes the strict compiler identity, local source/Git
 worktree identity, replayable build-script state, and the hardened validation
 and recovery rules described above.

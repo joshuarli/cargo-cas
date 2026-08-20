@@ -71,6 +71,7 @@ use std::io::SeekFrom;
 use std::io::prelude::*;
 use std::mem;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
@@ -1858,50 +1859,89 @@ impl GlobalContext {
     fn get_tool(&self, tool: Tool, from_config: &Option<ConfigRelativePath>) -> PathBuf {
         let tool_str = tool.as_str();
         self.maybe_get_tool(tool_str, from_config)
-            .or_else(|| {
-                // This is an optimization to circumvent the rustup proxies
-                // which can have a significant performance hit. The goal here
-                // is to determine if calling `rustc` from PATH would end up
-                // calling the proxies.
-                //
-                // This is somewhat cautious trying to determine if it is safe
-                // to circumvent rustup, because there are some situations
-                // where users may do things like modify PATH, call cargo
-                // directly, use a custom rustup toolchain link without a
-                // cargo executable, etc. However, there is still some risk
-                // this may make the wrong decision in unusual circumstances.
-                //
-                // First, we must be running under rustup in the first place.
-                let toolchain = self.get_env_os("RUSTUP_TOOLCHAIN")?;
-                // This currently does not support toolchain paths.
-                // This also enforces UTF-8.
-                if toolchain.to_str()?.contains(&['/', '\\']) {
-                    return None;
-                }
-                // If the tool on PATH is the same as `rustup` on path, then
-                // there is pretty good evidence that it will be a proxy.
-                let tool_resolved = paths::resolve_executable(Path::new(tool_str)).ok()?;
-                let rustup_resolved = paths::resolve_executable(Path::new("rustup")).ok()?;
-                let tool_meta = tool_resolved.metadata().ok()?;
-                let rustup_meta = rustup_resolved.metadata().ok()?;
-                // This works on the assumption that rustup and its proxies
-                // use hard links to a single binary. If rustup ever changes
-                // that setup, then I think the worst consequence is that this
-                // optimization will not work, and it will take the slow path.
-                if tool_meta.len() != rustup_meta.len() {
-                    return None;
-                }
-                // Try to find the tool in rustup's toolchain directory.
-                let tool_exe = Path::new(tool_str).with_extension(env::consts::EXE_EXTENSION);
-                let toolchain_exe = home::rustup_home()
-                    .ok()?
-                    .join("toolchains")
-                    .join(&toolchain)
-                    .join("bin")
-                    .join(&tool_exe);
-                toolchain_exe.exists().then_some(toolchain_exe)
-            })
+            .or_else(|| self.rustup_toolchain_tool(tool_str))
             .unwrap_or_else(|| PathBuf::from(tool_str))
+    }
+
+    /// Resolve a rustup proxy to the compiler selected from Cargo's invocation
+    /// directory. A direct Cargo binary does not receive rustup's
+    /// `RUSTUP_TOOLCHAIN` environment variable, so leaving the proxy as a bare
+    /// `rustc` lets each package cwd select a different toolchain. Resolving it
+    /// once keeps every compiler child process on the same toolchain.
+    fn rustup_toolchain_tool(&self, tool_str: &str) -> Option<PathBuf> {
+        if let Some(toolchain) = self.get_env_os("RUSTUP_TOOLCHAIN") {
+            // This is an optimization to circumvent the rustup proxies
+            // which can have a significant performance hit. The goal here is
+            // to determine if calling `rustc` from PATH would end up
+            // calling the proxies.
+            //
+            // This currently does not support toolchain paths.
+            // This also enforces UTF-8.
+            if toolchain.to_str()?.contains(&['/', '\\']) {
+                return None;
+            }
+            let tool_resolved = paths::resolve_executable(Path::new(tool_str)).ok()?;
+            let rustup_resolved = paths::resolve_executable(Path::new("rustup")).ok()?;
+            if !Self::same_rustup_proxy(&tool_resolved, &rustup_resolved) {
+                return None;
+            }
+            let tool_exe = Path::new(tool_str).with_extension(env::consts::EXE_EXTENSION);
+            let toolchain_exe = home::rustup_home()
+                .ok()?
+                .join("toolchains")
+                .join(toolchain)
+                .join("bin")
+                .join(&tool_exe);
+            return toolchain_exe.exists().then_some(toolchain_exe);
+        }
+
+        let tool_resolved = paths::resolve_executable(Path::new(tool_str)).ok()?;
+        let rustup_resolved = paths::resolve_executable(Path::new("rustup")).ok()?;
+        if !Self::same_rustup_proxy(&tool_resolved, &rustup_resolved) {
+            return None;
+        }
+
+        // `rustup which` applies rust-toolchain files and directory overrides
+        // relative to the directory where Cargo was launched. Its output is
+        // an absolute path, so package cwd changes cannot affect later child
+        // compiler invocations.
+        let output = Command::new(rustup_resolved)
+            .arg("which")
+            .arg(tool_str)
+            .current_dir(&self.cwd)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let path = PathBuf::from(String::from_utf8(output.stdout).ok()?.trim());
+        path.is_file().then_some(path)
+    }
+
+    /// Rustup installs its proxies beside the `rustup` executable. Older
+    /// installations use hard links, while package-manager installations may
+    /// use small wrapper scripts with different file sizes.
+    fn same_rustup_proxy(tool: &Path, rustup: &Path) -> bool {
+        if tool
+            .metadata()
+            .ok()
+            .zip(rustup.metadata().ok())
+            .is_some_and(|(tool, rustup)| tool.len() == rustup.len())
+        {
+            return true;
+        }
+
+        fn is_rustup_script(path: &Path) -> bool {
+            let Ok(contents) = fs::read(path) else {
+                return false;
+            };
+            contents.starts_with(b"#!")
+                && contents.windows(b"rustup".len()).any(|window| window == b"rustup")
+        }
+
+        tool.parent() == rustup.parent()
+            && is_rustup_script(tool)
+            && is_rustup_script(rustup)
     }
 
     /// Get the `paths` overrides config value.
