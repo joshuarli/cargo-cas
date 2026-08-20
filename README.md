@@ -96,6 +96,10 @@ still accepted for compatibility. Select the rustup toolchain with
 `RUSTUP_TOOLCHAIN=...` or a project override; a locally shadowed Cargo binary
 no longer receives rustup's `cargo +toolchain` proxy syntax.
 
+The implementation contract is documented in
+[`CARGO_CAS_ARCHITECTURE.md`](CARGO_CAS_ARCHITECTURE.md); unimplemented
+follow-up work is tracked in [`CARGO-CAS-TODO.md`](CARGO-CAS-TODO.md).
+
 ## Adding new subcommands to Cargo
 
 Cargo is designed to be extensible with new subcommands without having to modify
