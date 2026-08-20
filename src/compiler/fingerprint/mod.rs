@@ -421,6 +421,7 @@ use super::Work;
 use super::custom_build::BuildDeps;
 
 pub use self::dep_info::Checksum;
+pub use self::dep_info::is_relocatable_dep_info;
 pub use self::dep_info::parse_dep_info;
 pub use self::dep_info::parse_rustc_dep_info;
 pub use self::dep_info::translate_dep_info;

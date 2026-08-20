@@ -497,6 +497,23 @@ pub fn parse_dep_info(
     Ok(Some(ret))
 }
 
+/// Returns whether Cargo's translated dep-info can be materialized beneath a
+/// different build root without retaining the publisher's local paths.
+///
+/// `EncodedDepInfo` deliberately carries path kinds, so relative package- and
+/// build-root paths are interpreted against the destination on the next Cargo
+/// invocation. Absolute paths or tracked environment values have no V0
+/// ActionKey representation, so a global artifact entry must reject them.
+pub fn is_relocatable_dep_info(dep_info: &Path) -> bool {
+    let Ok(data) = paths::read_bytes(dep_info) else {
+        return false;
+    };
+    let Some(info) = EncodedDepInfo::parse(&data) else {
+        return false;
+    };
+    info.env.is_empty() && info.files.iter().all(|(_, path, _)| path.is_relative())
+}
+
 fn make_absolute_path(
     ty: DepInfoPathType,
     pkg_root: &Path,

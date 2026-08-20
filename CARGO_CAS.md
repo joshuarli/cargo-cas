@@ -646,10 +646,11 @@ workspace metadata into the global entry.
 `CARGO_LOG=cargo::compiler::cas=debug` exposes per-action `hit`, `miss`,
 `reject`, and `skip` decisions without changing Cargo's ordinary output. At
 the successful end of a cache-enabled invocation it also emits a structured
-`cargo-cas summary`: eligible units, hits, misses, rejects, eligible `rustc`
-work, same-key duplicate-build avoidance, and a reason-counted skip map. The
-summary is process-local observability, not mutable entry metadata; cache
-entries remain immutable after publication.
+`cargo-cas summary`: eligible units, hits, initial lookup misses, rejects,
+eligible `rustc` work, same-key duplicate-build avoidance, and a
+reason-counted skip map. A same-key waiter's lock-held recheck is deliberately
+not a second miss. The summary is process-local observability, not mutable
+entry metadata; cache entries remain immutable after publication.
 
 ## Pipelined cache hits
 
@@ -669,16 +670,20 @@ that Cargo replays the warning from the restored output cache.
 
 ## Cache-infrastructure failure boundary
 
-The cache root itself is checked with `symlink_metadata` before lookup,
-per-ActionKey locking, publication, and GC. A missing directory is created as
+The cache root and its mutable `locks`, `tmp`, and `access` children are each
+checked with `symlink_metadata` before use. A missing directory is created as
 an ordinary directory; a regular file, permission error, or substituted
 symlink makes that action a normal local compile and logs the cache failure at
-debug/warn level. Publication is still best effort, so an I/O failure such as
-disk exhaustion after successful rustc work cannot turn a valid Cargo build
-into a cache-only failure. `cargo clean gc` refuses a malformed root instead
-of traversing it. The integration regression substitutes the root with a
-symlink to an outside sentinel, proves no locks/staging/artifacts escape into
-that directory, then removes it and proves normal publish/hit recovery.
+debug/warn level. Artifact restore copies through a no-follow descriptor and
+rechecks the manifest size/digest while copying. Publication is still best
+effort, so an I/O failure such as disk exhaustion after successful rustc work
+cannot turn a valid Cargo build into a cache-only failure. `cargo clean gc`
+refuses a malformed root instead of traversing it and, while holding Cargo's
+package-cache mutation lock, removes incomplete staging directories and stale
+per-key lock files before enforcing its entry age/size policy. The integration
+regressions substitute the root and internal children with symlinks to an
+outside sentinel, prove no locks/staging/artifacts escape into that directory,
+then prove normal publish/hit recovery.
 
 ## Exact archaeology commands and checks
 

@@ -1675,7 +1675,9 @@ Deletion of cache contents can be performed by passing one of the cache options:
 The `cargo-cas` entries use their own last-use records and are not part of the
 automatic global-cache policy. They are only removed when one of the explicit
 `--max-cas-*` options is supplied. Removing an entry only turns its next use
-into a normal compilation; it does not affect build correctness.
+into a normal compilation; it does not affect build correctness. The same
+explicit sweep also clears incomplete `cargo-cas` staging directories and
+inactive per-action lock files before applying its size policy.
 
 A DURATION is specified in the form "N seconds/minutes/days/weeks/months" where N is an integer.
 
@@ -1720,9 +1722,11 @@ dependency warnings and future-incompatibility reporting visible without
 rerunning that dependency's `rustc` invocation.
 
 Each completed cache-enabled build also records one `cargo-cas summary` event.
-Its structured fields report eligible units, hits, misses, rejects, eligible
-`rustc` work, same-key duplicate-build avoidance, and skip counts grouped by
-reason. This is debug tracing only; it does not change normal Cargo output.
+Its structured fields report eligible units, hits, initial lookup misses,
+rejects, eligible `rustc` work, same-key duplicate-build avoidance, and skip
+counts grouped by reason. A same-key lock-held recheck is not counted as a
+second miss. This is debug tracing only; it does not change normal Cargo
+output.
 
 ## open-namespaces
 

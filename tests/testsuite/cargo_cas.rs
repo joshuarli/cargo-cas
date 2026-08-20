@@ -375,6 +375,11 @@ fn directory_file_size(path: &Path) -> u64 {
         .sum()
 }
 
+fn contains_path(bytes: &[u8], path: &Path) -> bool {
+    let path = path.to_str().unwrap().as_bytes();
+    bytes.windows(path.len()).any(|window| window == path)
+}
+
 #[cargo_test]
 fn registry_check_cache_reuses_only_matching_action_inputs() {
     registry::init();
@@ -420,6 +425,21 @@ pub fn answer() -> u32 { 41 }
     assert!(manifest_json["identity"]["toolchain"]["rustc_verbose_version"].is_string());
     assert!(manifest_json["identity"]["toolchain"]["sysroot"].is_string());
     assert!(manifest_json["identity"]["dependency_action_keys"].is_array());
+    let cached_dep_info = manifest_json["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|artifact| artifact["role"] == "dep-info")
+        .expect("a cache entry includes translated dep-info");
+    let cached_dep_info_path = manifest
+        .parent()
+        .unwrap()
+        .join("artifacts")
+        .join(cached_dep_info["file"].as_str().unwrap());
+    assert!(
+        !contains_path(&fs::read(cached_dep_info_path).unwrap(), &first_target),
+        "the globally stored dep-info must not retain the publishing target root"
+    );
 
     // A cache-format change is an explicit safe miss boundary. The same
     // ActionKey is allowed to be republished only after ordinary rustc work
@@ -673,6 +693,8 @@ edition = "2024"
 fn build_script_and_proc_macro_dependency_subgraphs_use_normal_rustc() {
     const BUILD_SCRIPT_PACKAGE: &str = "cas-build-script-dep";
     const BUILD_SCRIPT_CRATE: &str = "cas_build_script_dep";
+    const BUILD_SCRIPT_USER_PACKAGE: &str = "cas-build-script-user";
+    const BUILD_SCRIPT_USER_CRATE: &str = "cas_build_script_user";
     const PROC_MACRO_PACKAGE: &str = "cas-proc-macro-dep";
     const PROC_MACRO_CRATE: &str = "cas_proc_macro_dep";
     const PROC_MACRO_USER_PACKAGE: &str = "cas-proc-macro-user";
@@ -683,6 +705,14 @@ fn build_script_and_proc_macro_dependency_subgraphs_use_normal_rustc() {
         .edition("2024")
         .file("build.rs", "fn main() {}\n")
         .file("src/lib.rs", "pub fn answer() {}\n")
+        .publish();
+    Package::new(BUILD_SCRIPT_USER_PACKAGE, "1.0.0")
+        .edition("2024")
+        .dep(BUILD_SCRIPT_PACKAGE, "1.0.0")
+        .file(
+            "src/lib.rs",
+            "pub fn answer() { cas_build_script_dep::answer(); }\n",
+        )
         .publish();
     Package::new(PROC_MACRO_PACKAGE, "1.0.0")
         .edition("2024")
@@ -707,9 +737,9 @@ pub fn noop(_input: TokenStream) -> TokenStream { TokenStream::new() }
         .publish();
 
     let build_script_first =
-        registry_dependency_project("cas-build-script-first", BUILD_SCRIPT_PACKAGE);
+        registry_dependency_project("cas-build-script-first", BUILD_SCRIPT_USER_PACKAGE);
     let build_script_second =
-        registry_dependency_project("cas-build-script-second", BUILD_SCRIPT_PACKAGE);
+        registry_dependency_project("cas-build-script-second", BUILD_SCRIPT_USER_PACKAGE);
     let proc_macro_first =
         registry_dependency_project("cas-proc-macro-first", PROC_MACRO_USER_PACKAGE);
     let proc_macro_second =
@@ -724,14 +754,24 @@ pub fn noop(_input: TokenStream) -> TokenStream { TokenStream::new() }
         &build_script_first_output,
         BUILD_SCRIPT_CRATE
     ));
-    let build_script_second_output = run_check(
+    assert!(crate_was_compiled(
+        &build_script_first_output,
+        BUILD_SCRIPT_USER_CRATE
+    ));
+    let build_script_second_output = run_check_with_cas_log(
         &build_script_second,
         &paths::root().join("cas-build-script-second-target"),
-        "",
     );
     assert!(
-        crate_was_compiled(&build_script_second_output, BUILD_SCRIPT_CRATE),
+        crate_was_compiled(&build_script_second_output, BUILD_SCRIPT_CRATE)
+            && crate_was_compiled(&build_script_second_output, BUILD_SCRIPT_USER_CRATE),
         "a build-script-affected registry package must remain a normal compile:\n{}",
+        String::from_utf8_lossy(&build_script_second_output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&build_script_second_output.stderr)
+            .contains("cargo-cas skip: build-script affected"),
+        "a transitive build-script exclusion must remain observable:\n{}",
         String::from_utf8_lossy(&build_script_second_output.stderr)
     );
 
@@ -748,15 +788,20 @@ pub fn noop(_input: TokenStream) -> TokenStream { TokenStream::new() }
         &proc_macro_first_output,
         PROC_MACRO_USER_CRATE
     ));
-    let proc_macro_second_output = run_check(
+    let proc_macro_second_output = run_check_with_cas_log(
         &proc_macro_second,
         &paths::root().join("cas-proc-macro-second-target"),
-        "",
     );
     assert!(
         crate_was_compiled(&proc_macro_second_output, PROC_MACRO_CRATE)
             && crate_was_compiled(&proc_macro_second_output, PROC_MACRO_USER_CRATE),
         "a proc-macro-affected registry package must remain a normal compile:\n{}",
+        String::from_utf8_lossy(&proc_macro_second_output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&proc_macro_second_output.stderr)
+            .contains("cargo-cas skip: proc-macro affected"),
+        "a transitive proc-macro exclusion must remain observable:\n{}",
         String::from_utf8_lossy(&proc_macro_second_output.stderr)
     );
 }
@@ -843,6 +888,11 @@ edition = "2024"
     assert!(
         String::from_utf8_lossy(&first_output.stderr).contains("eligible_rustc=1"),
         "the cold build should report its one eligible compiler invocation:\n{}",
+        String::from_utf8_lossy(&first_output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&first_output.stderr).contains("misses=1"),
+        "one initial lookup must count as one miss, not a coordination recheck:\n{}",
         String::from_utf8_lossy(&first_output.stderr)
     );
 
@@ -1382,6 +1432,99 @@ edition = "2024"
         !String::from_utf8_lossy(&output.stderr).contains(&format!("--crate-name {CRATE}")),
         "the cached dependency must not run rustc:\n{}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cargo_test]
+fn cache_restore_falls_back_after_metadata_without_duplicate_pipeline_edges() {
+    const PACKAGE: &str = "cas-restore-fallback-dep";
+    const CRATE: &str = "cas_restore_fallback_dep";
+    const ROOT_CRATE: &str = "cas_restore_fallback_second";
+
+    registry::init();
+    Package::new(PACKAGE, "1.0.0")
+        .edition("2024")
+        .file("src/lib.rs", "pub fn answer() -> u32 { 42 }\n")
+        .publish();
+    let manifest = format!(
+        r#"[package]
+name = "cas-restore-fallback-second"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+{PACKAGE} = "1.0.0"
+"#,
+    );
+    let first = project_in("cas-restore-fallback-first")
+        .file("Cargo.toml", &manifest)
+        .file(
+            "src/lib.rs",
+            "pub fn answer() -> u32 { cas_restore_fallback_dep::answer() }\n",
+        )
+        .build();
+    let second = project_in("cas-restore-fallback-second")
+        .file("Cargo.toml", &manifest)
+        .file(
+            "src/lib.rs",
+            "pub fn answer() -> u32 { cas_restore_fallback_dep::answer() + 1 }\n",
+        )
+        .build();
+
+    let rustc = gated_rustc("cas-restore-fallback-rustc");
+    let log = paths::root().join("cas-restore-fallback-rustc.log");
+    let release = paths::root().join("cas-restore-fallback-rustc.release");
+    fs::write(&release, "observe only").unwrap();
+    let first_output = run_build_with_rustc(
+        &first,
+        &paths::root().join("cas-restore-fallback-first-target"),
+        &rustc,
+        ROOT_CRATE,
+        &log,
+        &release,
+    );
+    assert!(crate_was_compiled(&first_output, CRATE));
+    let cache_manifest_path = cache_manifest();
+    let manifest_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&cache_manifest_path).unwrap()).unwrap();
+    let linkable = manifest_json["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|artifact| artifact["role"] == "linkable")
+        .expect("a build cache entry includes its linkable artifact");
+    let linkable_path = cache_manifest_path
+        .parent()
+        .unwrap()
+        .join("artifacts")
+        .join(linkable["file"].as_str().unwrap());
+    fs::remove_file(&log).unwrap_or(());
+
+    let pause_signal = paths::root().join("cas-restore-fallback-rmeta-ready");
+    let child = start_build_paused_after_cas_rmeta(
+        &second,
+        &paths::root().join("cas-restore-fallback-second-target"),
+        &rustc,
+        ROOT_CRATE,
+        &log,
+        &release,
+        &pause_signal,
+    );
+    assert!(wait_for_path(&pause_signal));
+    // The manifest was valid at lookup. Simulate a concurrent cache file loss
+    // after the cache hit has released its metadata pipeline edge.
+    fs::remove_file(&linkable_path).unwrap();
+    fs::remove_file(&pause_signal).unwrap();
+    let output = wait_for_child(child);
+    assert!(
+        output.status.success(),
+        "a late cache restore failure must fall back to rustc: {output:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .any(|line| line.contains("rustc") && line.contains(&format!("--crate-name {CRATE}"))),
+        "the missing linkable artifact must trigger ordinary dependency rustc"
     );
 }
 
@@ -1978,6 +2121,71 @@ edition = "2024"
 }
 
 #[cargo_test]
+fn cache_internal_directories_never_follow_substituted_symlinks() {
+    const LOCK_PACKAGE: &str = "cas-internal-lock-dep";
+    const LOCK_CRATE: &str = "cas_internal_lock_dep";
+    const TMP_PACKAGE: &str = "cas-internal-tmp-dep";
+    const TMP_CRATE: &str = "cas_internal_tmp_dep";
+    const STAGE_PACKAGE: &str = "cas-internal-stage-dep";
+    const STAGE_CRATE: &str = "cas_internal_stage_dep";
+
+    registry::init();
+    for package in [LOCK_PACKAGE, TMP_PACKAGE, STAGE_PACKAGE] {
+        Package::new(package, "1.0.0")
+            .edition("2024")
+            .file("src/lib.rs", "pub fn answer() {}\n")
+            .publish();
+    }
+    let seed = registry_dependency_project("cas-internal-seed", LOCK_PACKAGE);
+    let lock_project = registry_dependency_project("cas-internal-lock", TMP_PACKAGE);
+    let tmp_project = registry_dependency_project("cas-internal-tmp", STAGE_PACKAGE);
+    let seed_output = run_check(&seed, &paths::root().join("cas-internal-seed-target"), "");
+    assert!(crate_was_compiled(&seed_output, LOCK_CRATE));
+
+    let cache = paths::cargo_home().join("cache/cargo-cas-v1");
+    let outside = paths::root().join("cas-internal-outside");
+    fs::create_dir_all(&outside).unwrap();
+
+    let locks = cache.join("locks");
+    fs::remove_dir_all(&locks).unwrap();
+    symlink(&outside, &locks).unwrap();
+    let lock_output = run_check(
+        &lock_project,
+        &paths::root().join("cas-internal-lock-target"),
+        "",
+    );
+    assert!(
+        crate_was_compiled(&lock_output, TMP_CRATE),
+        "a substituted lock directory must fall back to normal rustc:\n{}",
+        String::from_utf8_lossy(&lock_output.stderr)
+    );
+    assert!(
+        fs::read_dir(&outside).unwrap().next().is_none(),
+        "cache lock creation must not write through a symlink"
+    );
+
+    fs::remove_file(&locks).unwrap();
+    fs::create_dir(&locks).unwrap();
+    let temporary = cache.join("tmp");
+    fs::remove_dir_all(&temporary).unwrap();
+    symlink(&outside, &temporary).unwrap();
+    let tmp_output = run_check(
+        &tmp_project,
+        &paths::root().join("cas-internal-tmp-target"),
+        "",
+    );
+    assert!(
+        crate_was_compiled(&tmp_output, STAGE_CRATE),
+        "a substituted staging directory must leave a successful normal build:\n{}",
+        String::from_utf8_lossy(&tmp_output.stderr)
+    );
+    assert!(
+        fs::read_dir(&outside).unwrap().next().is_none(),
+        "cache staging must not write through a symlink"
+    );
+}
+
+#[cargo_test]
 fn concurrent_same_key_compiles_once_and_waiters_restore() {
     const PACKAGE: &str = "cas-gate-five-same";
     const CRATE: &str = "cas_gate_five_same";
@@ -2478,6 +2686,17 @@ edition = "2024"
         "a published cache entry records its last use separately from immutable artifacts"
     );
 
+    // A process killed before atomic publication can leave a staged directory
+    // behind, and per-key lock files are intentionally created lazily. An
+    // explicit GC policy owns the package-cache mutation lock, so it must
+    // account for and clean both rather than leaving bytes outside the size
+    // policy indefinitely.
+    let abandoned = cache_root.join("tmp/abandoned-publication");
+    fs::create_dir_all(&abandoned).unwrap();
+    fs::write(abandoned.join("artifact"), b"abandoned cache bytes").unwrap();
+    let stale_lock = cache_root.join("locks/stale-action.lock");
+    fs::write(&stale_lock, b"stale lock").unwrap();
+
     // An explicit size policy removes entire entries. The next use is an
     // ordinary cache miss and must rebuild rather than observing partial
     // state.
@@ -2487,6 +2706,8 @@ edition = "2024"
         "the zero-size policy must evict the immutable entry"
     );
     assert!(!first_access.exists());
+    assert!(!abandoned.exists(), "GC must remove abandoned staging");
+    assert!(!stale_lock.exists(), "GC must remove inactive CAS locks");
     let after_size_output = run_check(
         &after_size_gc,
         &paths::root().join("cas-gate-eight-after-size-gc-target"),

@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -150,8 +150,6 @@ pub(crate) struct CachePublication {
     key: ActionKey,
     identity: ManifestIdentityV1,
     cache: PathBuf,
-    package_root: PathBuf,
-    build_root: PathBuf,
     artifacts: Vec<ArtifactPath>,
 }
 
@@ -314,7 +312,7 @@ pub(crate) fn prepare(
     let key = match action_key(build_runner, unit) {
         Some(key) => key,
         None => {
-            let reason = ineligibility_reason(build_runner, unit)
+            let reason = ineligibility_reason_in_subgraph(build_runner, unit)
                 .unwrap_or("an ineligible dependency action");
             build_runner.cas_stats.skip(reason);
             debug!(
@@ -350,20 +348,37 @@ impl CacheAction {
     /// A lock-free hit check. Immutable entries are published by atomic rename,
     /// so readers never need to serialize with other readers.
     pub(crate) fn lookup(&self) -> Option<CacheEntry> {
+        self.lookup_inner(true)
+    }
+
+    /// A same-key waiter rechecks after the writer lock becomes available.
+    /// That recheck is a coordination detail, not a second cache lookup
+    /// attempt in the per-invocation summary.
+    fn lookup_after_lock(&self) -> Option<CacheEntry> {
+        self.lookup_inner(false)
+    }
+
+    fn lookup_inner(&self, count_miss: bool) -> Option<CacheEntry> {
         if !is_plain_directory(&self.cache) {
-            self.stats.miss();
+            if count_miss {
+                self.stats.miss();
+            }
             debug!(path = %self.cache.display(), "cargo-cas miss: cache root unavailable");
             return None;
         }
         let root = self.cache.join(self.key.as_str());
         if !is_plain_directory(&root) {
-            self.stats.miss();
+            if count_miss {
+                self.stats.miss();
+            }
             debug!(key = self.key.as_str(), "cargo-cas miss: entry absent");
             return None;
         }
         let manifest_path = root.join(MANIFEST_FILE);
         let Ok(manifest_bytes) = read_regular_file(&manifest_path) else {
-            self.stats.miss();
+            if count_miss {
+                self.stats.miss();
+            }
             debug!(
                 key = self.key.as_str(),
                 "cargo-cas miss: manifest unavailable"
@@ -443,6 +458,8 @@ impl CacheAction {
                     entry.root.join(ARTIFACTS_DIRECTORY).join(&cached.file),
                     expected.destination.clone(),
                     cached.role,
+                    cached.size,
+                    cached.digest.clone(),
                 )
             })
             .collect::<Vec<_>>();
@@ -450,13 +467,13 @@ impl CacheAction {
 
         Work::new(move |state| {
             let restored: CargoResult<()> = (|| {
-                for (source, destination, role) in restores {
+                for (source, destination, role, size, digest) in restores {
                     let parent = destination.parent().expect("Cargo output path has parent");
                     paths::create_dir_all(parent)?;
                     // Cache entries are immutable. Copy rather than hardlink so a
                     // later local output cleanup or compiler invocation can never
                     // mutate a globally cached inode.
-                    fs::copy(source, destination)?;
+                    copy_verified_artifact(&source, &destination, size, &digest)?;
                     if role == ArtifactRole::Rmeta {
                         // Pipelined metadata consumers can begin as soon as
                         // the restored `.rmeta` is locally available. The
@@ -501,7 +518,7 @@ impl CacheAction {
         Work::new(move |state| match self.lock() {
             Ok(_lock) => {
                 if allow_hit {
-                    if let Some(entry) = self.lookup() {
+                    if let Some(entry) = self.lookup_after_lock() {
                         self.stats.duplicate_build_avoidance();
                         return self
                             .restore_or_compile(entry, normal_work, replay_output)
@@ -520,14 +537,8 @@ impl CacheAction {
     }
 
     fn lock(&self) -> io::Result<File> {
-        ensure_cache_root(&self.cache)?;
-        let lock_path = self
-            .cache
-            .join(LOCKS_DIRECTORY)
+        let lock_path = ensure_cache_subdirectory(&self.cache, LOCKS_DIRECTORY)?
             .join(format!("{}.lock", self.key.as_str()));
-        if let Some(parent) = lock_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
         if fs::symlink_metadata(&lock_path).is_ok_and(|metadata| !metadata.file_type().is_file()) {
             return Err(io::Error::other("cargo-cas key lock is not a regular file"));
         }
@@ -561,8 +572,6 @@ pub(crate) fn publication(
         key,
         identity,
         cache: cache_root(build_runner),
-        package_root: unit.pkg.root().to_path_buf(),
-        build_root: build_runner.bcx.ws.build_dir().into_path_unlocked(),
         artifacts: artifact_paths(build_runner, unit)?,
     }))
 }
@@ -581,9 +590,10 @@ impl CachePublication {
     }
 
     fn publish_inner(&self) -> CargoResult<()> {
-        // Cargo records any `env!`/`option_env!` inputs in its translated dep-info.
-        // V0 does not yet have a pre-compilation identity for arbitrary inherited
-        // environment, so such units are deliberately not published.
+        // Cargo's encoded dep-info has a relative path representation, but a
+        // unit may still record an absolute or environment input that V0 does
+        // not represent in its pre-compilation identity. Do not publish those
+        // units as globally reusable actions.
         let dep_info = self
             .artifacts
             .iter()
@@ -591,13 +601,8 @@ impl CachePublication {
             .expect("cargo-cas publication includes dep-info")
             .source
             .clone();
-        let Some(dep_info_contents) =
-            fingerprint::parse_dep_info(&self.package_root, &self.build_root, &dep_info)?
-        else {
-            return Ok(());
-        };
-        if !dep_info_contents.env.is_empty() {
-            debug!("cargo-cas skips unit with fingerprinted environment");
+        if !fingerprint::is_relocatable_dep_info(&dep_info) {
+            debug!("cargo-cas skips unit with non-relocatable translated dep-info");
             return Ok(());
         }
 
@@ -625,14 +630,15 @@ impl CachePublication {
             remove_entry(&final_entry)?;
         }
 
-        let temporary_entry = self.cache.join("tmp").join(format!(
+        let temporary_entry = ensure_cache_subdirectory(&self.cache, "tmp")?.join(format!(
             "{}-{}-{}",
             self.key.as_str(),
             std::process::id(),
             TEMPORARY_ENTRY_COUNTER.fetch_add(1, Ordering::Relaxed),
         ));
         let temporary_artifacts = temporary_entry.join(ARTIFACTS_DIRECTORY);
-        paths::create_dir_all(&temporary_artifacts)?;
+        fs::create_dir(&temporary_entry)?;
+        fs::create_dir(&temporary_artifacts)?;
 
         let mut manifest_artifacts = Vec::with_capacity(self.artifacts.len());
         for (index, artifact) in self.artifacts.iter().enumerate() {
@@ -914,6 +920,42 @@ fn eligible_without_dependencies(build_runner: &BuildRunner<'_, '_>, unit: &Unit
     ineligibility_reason(build_runner, unit).is_none()
 }
 
+/// Distinguishes a direct V0 exclusion from a conservative exclusion inherited
+/// through an otherwise cacheable dependency action. The scheduler still falls
+/// back in both cases, but the latter tells users which future model (build
+/// scripts or proc macros) would be required to broaden the subgraph safely.
+fn ineligibility_reason_in_subgraph(
+    build_runner: &BuildRunner<'_, '_>,
+    unit: &Unit,
+) -> Option<&'static str> {
+    let mut visiting = BTreeSet::new();
+    ineligibility_reason_in_subgraph_inner(build_runner, unit, &mut visiting)
+}
+
+fn ineligibility_reason_in_subgraph_inner(
+    build_runner: &BuildRunner<'_, '_>,
+    unit: &Unit,
+    visiting: &mut BTreeSet<Unit>,
+) -> Option<&'static str> {
+    if let Some(reason) = ineligibility_reason(build_runner, unit) {
+        return Some(reason);
+    }
+    if !visiting.insert(unit.clone()) {
+        return Some("an ineligible dependency action");
+    }
+    let reason = build_runner.unit_deps(unit).iter().find_map(|dependency| {
+        let reason =
+            ineligibility_reason_in_subgraph_inner(build_runner, &dependency.unit, visiting)?;
+        Some(match reason {
+            "package has a build script" | "build-script affected" => "build-script affected",
+            "proc macro" | "proc-macro affected" => "proc-macro affected",
+            _ => "an ineligible dependency action",
+        })
+    });
+    visiting.remove(unit);
+    reason
+}
+
 /// Explains why V0 refuses an otherwise ordinary dirty unit. These messages
 /// are emitted only through debug tracing, keeping default Cargo output
 /// unchanged while making conservative eligibility inspectable in tests and
@@ -1117,21 +1159,26 @@ pub(crate) fn gc(
     let mut entries = cache_entries(&root)?;
     let now = SystemTime::now();
     let mut remove = Vec::new();
+    // GC owns Cargo's package-cache mutation lock, so no cache action is
+    // active. Clear incomplete publication directories and per-key lock files
+    // before applying a size policy; otherwise a killed writer could retain
+    // unaccounted cache bytes forever.
+    remove_temporary_entries(&root, &mut remove)?;
+    remove_cache_lock_files(&root, &mut remove)?;
 
     if let Some(max_age) = max_age {
         let cutoff = now.checked_sub(max_age).unwrap_or(SystemTime::UNIX_EPOCH);
         entries.retain(|entry| {
             if entry.last_used < cutoff {
                 remove.push(entry.path.clone());
-                if entry.access.is_file() {
-                    remove.push(entry.access.clone());
+                if let Some(access) = &entry.access {
+                    remove.push(access.clone());
                 }
                 false
             } else {
                 true
             }
         });
-        remove_abandoned_temporary_entries(&root, cutoff, &mut remove)?;
     }
 
     if let Some(max_size) = max_size {
@@ -1143,8 +1190,8 @@ pub(crate) fn gc(
             }
             total_size = total_size.saturating_sub(entry.size);
             remove.push(entry.path);
-            if entry.access.is_file() {
-                remove.push(entry.access);
+            if let Some(access) = entry.access {
+                remove.push(access);
             }
         }
     }
@@ -1157,7 +1204,7 @@ pub(crate) fn gc(
 
 struct CacheGcEntry {
     path: PathBuf,
-    access: PathBuf,
+    access: Option<PathBuf>,
     last_used: SystemTime,
     size: u64,
 }
@@ -1171,6 +1218,7 @@ fn cache_entries(root: &Path) -> CargoResult<Vec<CacheGcEntry>> {
         Err(error) => return Err(error.into()),
         Ok(_) => {}
     }
+    let access_root = cache_subdirectory(root, ACCESS_DIRECTORY)?;
     let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -1184,10 +1232,22 @@ fn cache_entries(root: &Path) -> CargoResult<Vec<CacheGcEntry>> {
         })
         .map(|entry| {
             let path = entry.path();
-            let access = root.join(ACCESS_DIRECTORY).join(entry.file_name());
-            let last_used = fs::metadata(&access)
-                .and_then(|metadata| metadata.modified())
-                .or_else(|_| fs::metadata(&path).and_then(|metadata| metadata.modified()))
+            let access = access_root
+                .as_ref()
+                .map(|access_root| access_root.join(entry.file_name()));
+            let last_used = access
+                .as_ref()
+                .and_then(|access| {
+                    fs::symlink_metadata(access)
+                        .ok()
+                        .filter(|metadata| metadata.file_type().is_file())
+                        .and_then(|metadata| metadata.modified().ok())
+                })
+                .or_else(|| {
+                    fs::metadata(&path)
+                        .and_then(|metadata| metadata.modified())
+                        .ok()
+                })
                 // Unknown timestamps must be retained; the cache is only an
                 // optimization, but GC should prefer a harmless miss delay to
                 // deleting an entry it cannot age safely.
@@ -1202,24 +1262,25 @@ fn cache_entries(root: &Path) -> CargoResult<Vec<CacheGcEntry>> {
         .collect()
 }
 
-fn remove_abandoned_temporary_entries(
-    root: &Path,
-    cutoff: SystemTime,
-    remove: &mut Vec<PathBuf>,
-) -> CargoResult<()> {
-    let temporary_root = root.join("tmp");
-    let entries = match fs::read_dir(&temporary_root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
+fn remove_temporary_entries(root: &Path, remove: &mut Vec<PathBuf>) -> CargoResult<()> {
+    let Some(temporary_root) = cache_subdirectory(root, "tmp")? else {
+        return Ok(());
     };
+    let entries = fs::read_dir(&temporary_root)?;
     for entry in entries.filter_map(Result::ok) {
-        if entry.file_type()?.is_dir()
-            && entry
-                .metadata()?
-                .modified()
-                .is_ok_and(|modified| modified < cutoff)
-        {
+        if entry.file_type()?.is_dir() {
+            remove.push(entry.path());
+        }
+    }
+    Ok(())
+}
+
+fn remove_cache_lock_files(root: &Path, remove: &mut Vec<PathBuf>) -> CargoResult<()> {
+    let Some(locks_root) = cache_subdirectory(root, LOCKS_DIRECTORY)? else {
+        return Ok(());
+    };
+    for entry in fs::read_dir(locks_root)?.filter_map(Result::ok) {
+        if entry.file_type()?.is_file() {
             remove.push(entry.path());
         }
     }
@@ -1241,10 +1302,8 @@ fn is_action_key_name(name: &str) -> bool {
 }
 
 fn mark_used(cache: &Path, key: &str) {
-    let access = cache.join(ACCESS_DIRECTORY).join(key);
     let result = (|| -> io::Result<()> {
-        let parent = access.parent().expect("cargo-cas access path has parent");
-        fs::create_dir_all(parent)?;
+        let access = ensure_cache_subdirectory(cache, ACCESS_DIRECTORY)?.join(key);
         let mut options = OpenOptions::new();
         options.create(true).append(true);
         #[cfg(unix)]
@@ -1291,6 +1350,41 @@ fn ensure_cache_root(cache: &Path) -> io::Result<()> {
         Ok(())
     } else {
         Err(io::Error::other("cargo-cas cache root is not a directory"))
+    }
+}
+
+/// Returns a direct child of the cache root only when it is an ordinary
+/// directory. Cache-internal mutable directories are write boundaries just as
+/// much as the root itself: following a substituted `locks`, `tmp`, or
+/// `access` symlink would redirect an otherwise best-effort cache operation.
+fn cache_subdirectory(cache: &Path, name: &str) -> io::Result<Option<PathBuf>> {
+    let path = cache.join(name);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(Some(path)),
+        Ok(_) => Err(io::Error::other(format!(
+            "cargo-cas {name} directory is not a directory"
+        ))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn ensure_cache_subdirectory(cache: &Path, name: &str) -> io::Result<PathBuf> {
+    ensure_cache_root(cache)?;
+    if let Some(path) = cache_subdirectory(cache, name)? {
+        return Ok(path);
+    }
+    let path = cache.join(name);
+    match fs::create_dir(&path) {
+        Ok(()) => Ok(path),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            cache_subdirectory(cache, name)?.ok_or_else(|| {
+                io::Error::other(format!(
+                    "cargo-cas {name} directory disappeared during creation"
+                ))
+            })
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -1377,6 +1471,44 @@ fn open_regular_file(path: &Path) -> io::Result<File> {
         return Err(io::Error::other("cargo-cas entry is not a regular file"));
     }
     Ok(file)
+}
+
+/// Copies an entry artifact through a no-follow descriptor and proves that the
+/// bytes observed at restore time are still the manifest bytes validated at
+/// lookup time. This closes the validation-to-copy window for a locally
+/// substituted cache artifact.
+fn copy_verified_artifact(
+    source: &Path,
+    destination: &Path,
+    expected_size: u64,
+    expected_digest: &str,
+) -> io::Result<()> {
+    let mut source = open_regular_file(source)?;
+    let mut destination = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(destination)?;
+    let mut digest = blake3::Hasher::new();
+    let mut size = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = source.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        destination.write_all(&buffer[..count])?;
+        digest.update(&buffer[..count]);
+        size = size.saturating_add(count as u64);
+    }
+    destination.flush()?;
+    if size != expected_size || digest.finalize().to_hex().as_str() != expected_digest {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cargo-cas artifact changed after manifest validation",
+        ));
+    }
+    Ok(())
 }
 
 fn manifest_matches_expected(manifest: &CacheManifestV1, expected: &[ArtifactPath]) -> bool {
