@@ -93,6 +93,12 @@ fn run_normal_build(project: &Project, target_dir: &Path) -> RawOutput {
     cargo.run()
 }
 
+fn run_clean(project: &Project, target_dir: &Path) -> RawOutput {
+    let mut cargo = project.cargo("clean -vv");
+    cargo.arg("--target-dir").arg(target_dir);
+    cargo.run()
+}
+
 fn run_cas_gc(project: &Project, options: &str) -> RawOutput {
     let mut cargo = project.cargo(&format!("clean gc -Zgc {options}"));
     cargo.masquerade_as_nightly_cargo(&["gc"]);
@@ -1169,6 +1175,54 @@ edition = "2024"
     assert!(
         separate_build_dir.is_dir(),
         "the configured build-dir must receive the restored local compiler state"
+    );
+}
+
+#[cargo_test]
+fn cargo_clean_keeps_global_cargo_cas_entries() {
+    const PACKAGE: &str = "cas-clean-dep";
+    const CRATE: &str = "cas_clean_dep";
+
+    registry::init();
+    Package::new(PACKAGE, "1.0.0")
+        .edition("2024")
+        .file("src/lib.rs", "pub fn answer() {}\n")
+        .publish();
+    let manifest = format!(
+        r#"[package]
+name = "cas-clean-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+{PACKAGE} = "1.0.0"
+"#,
+    );
+    let first = project_in("cas-clean-first")
+        .file("Cargo.toml", &manifest)
+        .file("src/main.rs", "fn main() { cas_clean_dep::answer(); }\n")
+        .build();
+    let second = project_in("cas-clean-second")
+        .file("Cargo.toml", &manifest)
+        .file("src/main.rs", "fn main() { cas_clean_dep::answer(); }\n")
+        .build();
+
+    let first_target = paths::root().join("cas-clean-first-target");
+    let first_output = run_check(&first, &first_target, "");
+    assert!(crate_was_compiled(&first_output, CRATE));
+    let entry_manifest = cache_manifest();
+
+    run_clean(&first, &first_target);
+    assert!(
+        entry_manifest.is_file(),
+        "ordinary cargo clean must only remove local build state, not the global immutable entry"
+    );
+
+    let second_output = run_check(&second, &paths::root().join("cas-clean-second-target"), "");
+    assert!(
+        !crate_was_compiled(&second_output, CRATE),
+        "an entry retained across cargo clean must remain reusable:\n{}",
+        String::from_utf8_lossy(&second_output.stderr)
     );
 }
 
