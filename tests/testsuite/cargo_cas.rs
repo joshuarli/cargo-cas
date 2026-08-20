@@ -1114,6 +1114,65 @@ edition = "2024"
 }
 
 #[cargo_test]
+fn cargo_cas_reuses_across_separate_build_directories() {
+    const PACKAGE: &str = "cas-build-dir-dep";
+    const CRATE: &str = "cas_build_dir_dep";
+
+    registry::init();
+    Package::new(PACKAGE, "1.0.0")
+        .edition("2024")
+        .file("src/lib.rs", "pub fn answer() {}\n")
+        .publish();
+    let manifest = format!(
+        r#"[package]
+name = "cas-build-dir-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+{PACKAGE} = "1.0.0"
+"#,
+    );
+    let first = project_in("cas-build-dir-first")
+        .file("Cargo.toml", &manifest)
+        .file(
+            "src/main.rs",
+            "fn main() { cas_build_dir_dep::answer(); }\n",
+        )
+        .build();
+    let second = project_in("cas-build-dir-second")
+        .file("Cargo.toml", &manifest)
+        .file(
+            "src/main.rs",
+            "fn main() { cas_build_dir_dep::answer(); }\n",
+        )
+        .build();
+
+    let first_output = run_check(
+        &first,
+        &paths::root().join("cas-build-dir-first-target"),
+        "",
+    );
+    assert!(crate_was_compiled(&first_output, CRATE));
+
+    let separate_build_dir = paths::root().join("cas-build-dir-second-intermediates");
+    let second_output = run_check_with_config(
+        &second,
+        &paths::root().join("cas-build-dir-second-target"),
+        &format!(r#"build.build-dir="{}""#, separate_build_dir.display()),
+    );
+    assert!(
+        !crate_was_compiled(&second_output, CRATE),
+        "a workspace-local build-dir path must not prevent a matching global action hit:\n{}",
+        String::from_utf8_lossy(&second_output.stderr)
+    );
+    assert!(
+        separate_build_dir.is_dir(),
+        "the configured build-dir must receive the restored local compiler state"
+    );
+}
+
+#[cargo_test]
 fn killed_cargo_before_atomic_publish_leaves_no_cache_hit() {
     const PACKAGE: &str = "cas-gate-four-killed-writer";
     const CRATE: &str = "cas_gate_four_killed_writer";
