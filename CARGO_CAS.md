@@ -641,6 +641,22 @@ If artifacts are not relocatable, record the exact rustc/Cargo path input that
 requires remapping or exclusion. Do not paper over it by copying arbitrary
 workspace metadata into the global entry.
 
+## Local path demonstration
+
+`make demo` runs the focused `epsh` → `ish` experiment used while developing
+local-path and build-script support. It builds each checkout first with regular
+Cargo and then with the debug `cargo-cas` binary, using isolated target
+directories and private Cargo homes. The `ish` invocation is temporarily
+patched to depend on `~/d/epsh`; `resolver.lockfile-path` points Cargo at a
+temporary lockfile so neither checkout is modified.
+
+The demo reports per-package timings, target usage, cache entries available from
+the first build, and entries published by the second build. All temporary state
+is removed on success, failure, or interruption. Set `KEEP=1 make demo` to keep
+the logs and targets for inspection. Set `TRACE=1 KEEP=1 make demo` to include
+the structured CAS hit/skip summaries in the output; traced timings include
+debug-logging overhead.
+
 ## Cache observability
 
 `CARGO_LOG=cargo::compiler::cas=debug` exposes per-action `hit`, `miss`,
