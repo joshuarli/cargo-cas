@@ -142,6 +142,7 @@ assert_equal 1 "$cold_rustc" 'cold workspace compiles the shared dependency once
 run_check "$workspace_b" "$work_root/target-b" "$work_root/b.log"
 warm_rustc=$(count_dependency_rustc)
 assert_equal "$cold_rustc" "$warm_rustc" 'unrelated workspace reuses the base action'
+second_workspace_rustc=$((warm_rustc - cold_rustc))
 
 run_check "$workspace_feature" "$work_root/target-feature" "$work_root/feature.log"
 feature_rustc=$(count_dependency_rustc)
@@ -177,6 +178,7 @@ done
 
 worktree_rustc=$(count_dependency_rustc)
 assert_equal 3 "$worktree_rustc" 'eight concurrent worktrees compile one new action once'
+avoided_invocations=$((1 + 1 + 7))
 
 cache_root="$CARGO_HOME/cache/cargo-cas-v1"
 cache_entries=$(find "$cache_root" -mindepth 1 -maxdepth 1 -type d -print \
@@ -188,8 +190,8 @@ cache_misses=$(grep -h 'cargo-cas miss' "$work_root"/*.log 2>/dev/null | wc -l |
 cat <<EOF
 cargo-cas demo complete
   cold rustc invocations:       $cold_rustc
-  second-workspace invocations: $warm_rustc
-  avoided invocations:          $((8 - 1))
+  second-workspace invocations: $second_workspace_rustc
+  avoided invocations:          $avoided_invocations
   cache hits:                   $cache_hits
   cache misses:                 $cache_misses
   cache entries:                $cache_entries
