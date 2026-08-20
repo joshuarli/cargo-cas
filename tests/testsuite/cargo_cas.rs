@@ -128,6 +128,33 @@ fn start_gated_check(
         .unwrap()
 }
 
+fn start_gated_check_in_dir(
+    driver: &Project,
+    working_dir: &Path,
+    target_dir: &Path,
+    rustc: &Path,
+    trigger_crate: &str,
+    log: &Path,
+    release: &Path,
+) -> Child {
+    let mut cargo = driver.cargo("check -Zcargo-cas -vv");
+    cargo
+        .cwd(working_dir)
+        .arg("--target-dir")
+        .arg(target_dir)
+        .env("RUSTC", rustc)
+        .env("CAS_TRIGGER_CRATE", trigger_crate)
+        .env("CAS_LOG", log)
+        .env("CAS_RELEASE", release)
+        .masquerade_as_nightly_cargo(&["cargo-cas"]);
+    cargo
+        .build_command()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
 fn wait_for_log_line(log: &Path, line: &str) -> bool {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
@@ -158,6 +185,16 @@ fn wait_for_child(child: Child) -> Output {
     thread::spawn(move || child.wait_with_output().unwrap())
         .join()
         .unwrap()
+}
+
+fn directory_file_size(path: &Path) -> u64 {
+    walkdir::WalkDir::new(path)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_type().is_file().then(|| entry.metadata().ok()))
+        .flatten()
+        .map(|metadata| metadata.len())
+        .sum()
 }
 
 #[cargo_test]
@@ -686,5 +723,120 @@ edition = "2024"
         left_started && right_started,
         "different ActionKeys serialized: {}",
         fs::read_to_string(&log).unwrap_or_default()
+    );
+}
+
+#[cargo_test]
+fn eight_worktrees_share_one_registry_action_without_rebuilding_it() {
+    const PACKAGE: &str = "cas-gate-six-dep";
+    const CRATE: &str = "cas_gate_six_dep";
+    const ROOT_CRATE: &str = "cas_gate_six_app";
+    const WORKTREE_COUNT: usize = 8;
+
+    registry::init();
+    Package::new(PACKAGE, "1.0.0")
+        .edition("2024")
+        .file("src/lib.rs", "pub fn answer() -> u32 { 42 }\n")
+        .publish();
+
+    let repository_root = paths::root().join("cas-gate-six-repository");
+    let manifest = format!(
+        r#"[package]
+name = "cas-gate-six-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+{PACKAGE} = "1.0.0"
+"#,
+    );
+    let source = cargo_test_support::git::repo(&repository_root)
+        .file("Cargo.toml", &manifest)
+        .file("src/main.rs", "fn main() { println!(\"seed\"); }\n")
+        .build();
+    let repository = git2::Repository::open(source.root()).unwrap();
+    let worktrees_root = paths::root().join("cas-gate-six-worktrees");
+    fs::create_dir_all(&worktrees_root).unwrap();
+
+    let mut worktrees = vec![source.root().to_path_buf()];
+    for index in 1..WORKTREE_COUNT {
+        let path = worktrees_root.join(format!("worktree-{index}"));
+        let options = git2::WorktreeAddOptions::new();
+        repository
+            .worktree(&format!("worktree-{index}"), &path, Some(&options))
+            .unwrap();
+        worktrees.push(path);
+    }
+    for (index, worktree) in worktrees.iter().enumerate() {
+        fs::write(
+            worktree.join("src/main.rs"),
+            format!("fn main() {{ println!(\"{{}}\", cas_gate_six_dep::answer() + {index}); }}\n"),
+        )
+        .unwrap();
+    }
+
+    let driver = project_in("cas-gate-six-driver").no_manifest().build();
+    let rustc = gated_rustc("cas-gate-six-rustc");
+    let log = paths::root().join("cas-gate-six.log");
+    let release = paths::root().join("cas-gate-six.release");
+    let start = Instant::now();
+    let children = worktrees
+        .iter()
+        .enumerate()
+        .map(|(index, worktree)| {
+            start_gated_check_in_dir(
+                &driver,
+                worktree,
+                &paths::root().join(format!("cas-gate-six-target-{index}")),
+                &rustc,
+                CRATE,
+                &log,
+                &release,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    assert!(wait_for_log_line(&log, CRATE));
+    let duplicate_compiler_started = wait_for_log_lines(&log, 2);
+    fs::write(&release, "release").unwrap();
+    let outputs = children.into_iter().map(wait_for_child).collect::<Vec<_>>();
+    assert!(
+        outputs.iter().all(|output| output.status.success()),
+        "one of the concurrent worktree builds failed: {outputs:#?}"
+    );
+    assert!(
+        !duplicate_compiler_started,
+        "the shared action compiled more than once: {}",
+        fs::read_to_string(&log).unwrap_or_default()
+    );
+    assert_eq!(fs::read_to_string(&log).unwrap().lines().count(), 1);
+    assert!(
+        outputs.iter().all(|output| {
+            String::from_utf8_lossy(&output.stderr).contains(&format!("--crate-name {ROOT_CRATE}"))
+        }),
+        "every distinct worktree root must compile independently"
+    );
+
+    let cache_root = paths::cargo_home().join("cache/cargo-cas-v0");
+    let cache_entries = fs::read_dir(&cache_root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().join("manifest.json").is_file())
+        .count();
+    let elapsed = start.elapsed();
+    let workspace_bytes = (0..WORKTREE_COUNT)
+        .map(|index| {
+            directory_file_size(&paths::root().join(format!("cas-gate-six-target-{index}")))
+        })
+        .sum::<u64>();
+    eprintln!(
+        "cargo-cas Gate 6: worktrees={WORKTREE_COUNT}, shared-rustc=1, \
+         local-rustc={WORKTREE_COUNT}, cache-hits={}, cache-misses=1, \
+         duplicate-builds-avoided={}, cache-entries={cache_entries}, \
+         cache-bytes={}, workspace-bytes={workspace_bytes}, elapsed-ms={}",
+        WORKTREE_COUNT - 1,
+        WORKTREE_COUNT - 1,
+        directory_file_size(&cache_root),
+        elapsed.as_millis(),
     );
 }
