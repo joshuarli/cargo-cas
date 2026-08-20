@@ -91,7 +91,7 @@ edition = "2024"
 }
 
 fn cache_manifest() -> std::path::PathBuf {
-    let cache = paths::home().join(".cargo/cache/cargo-cas-v0");
+    let cache = paths::home().join(".cargo/cache/cargo-cas-v1");
     fs::read_dir(&cache)
         .unwrap()
         .map(Result::unwrap)
@@ -275,6 +275,16 @@ pub fn answer() -> u32 { 41 }
         String::from_utf8_lossy(&first_output.stderr)
     );
     let manifest = cache_manifest();
+    let manifest_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&manifest).unwrap()).unwrap();
+    assert_eq!(manifest_json["format_version"], 1);
+    assert_eq!(manifest_json["identity"]["target_name"], REGISTRY_CRATE);
+    assert_eq!(manifest_json["identity"]["compile_mode"], "check");
+    assert!(manifest_json["identity"]["package_id"].is_string());
+    assert!(manifest_json["identity"]["toolchain"]["rustc_path"].is_string());
+    assert!(manifest_json["identity"]["toolchain"]["rustc_verbose_version"].is_string());
+    assert!(manifest_json["identity"]["toolchain"]["sysroot"].is_string());
+    assert!(manifest_json["identity"]["dependency_action_keys"].is_array());
 
     let exact_output = run_check(&exact, &paths::root().join("cas-exact-target"), "");
     assert!(
@@ -313,6 +323,26 @@ pub fn answer() -> u32 { 41 }
         crate_was_compiled(&flags_output, REGISTRY_CRATE),
         "rustflags changes must not hit a differently flagged entry:\n{}",
         String::from_utf8_lossy(&flags_output.stderr)
+    );
+
+    // The ActionKey remains the lookup address, but its semantic identity is
+    // duplicated in the manifest so an altered package/unit/toolchain record
+    // is independently rejected before artifact materialization.
+    let mut poisoned_manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&manifest).unwrap()).unwrap();
+    poisoned_manifest["identity"]["toolchain"]["rustc_path"] =
+        serde_json::Value::String("/poisoned/rustc".to_owned());
+    fs::write(&manifest, serde_json::to_vec(&poisoned_manifest).unwrap()).unwrap();
+    let identity_fallback = registry_project("cas-identity-fallback", "\"1.0.0\"");
+    let identity_fallback_output = run_check(
+        &identity_fallback,
+        &paths::root().join("cas-identity-fallback-target"),
+        "",
+    );
+    assert!(
+        crate_was_compiled(&identity_fallback_output, REGISTRY_CRATE),
+        "an entry with mismatched manifest identity must be rebuilt:\n{}",
+        String::from_utf8_lossy(&identity_fallback_output.stderr)
     );
 
     // Cache damage is a performance problem, never a build failure.  A bad
@@ -621,7 +651,7 @@ fn cache_ignores_partial_entries_and_repairs_corrupt_writer_state() {
 
     // This is exactly the state left by a process that dies while staging an
     // entry.  `tmp` is never considered by lookup, so it cannot become a hit.
-    let cache = paths::cargo_home().join("cache/cargo-cas-v0");
+    let cache = paths::cargo_home().join("cache/cargo-cas-v1");
     let abandoned = cache.join("tmp/crashed-writer/artifacts/0");
     fs::create_dir_all(abandoned.parent().unwrap()).unwrap();
     fs::write(&abandoned, b"partial artifact").unwrap();
@@ -1021,7 +1051,7 @@ edition = "2024"
         "every distinct worktree root must compile independently"
     );
 
-    let cache_root = paths::cargo_home().join("cache/cargo-cas-v0");
+    let cache_root = paths::cargo_home().join("cache/cargo-cas-v1");
     let cache_entries = fs::read_dir(&cache_root)
         .unwrap()
         .filter_map(Result::ok)
@@ -1233,7 +1263,7 @@ edition = "2024"
     );
     assert!(crate_was_compiled(&first_output, CRATE));
     let first_manifest = cache_manifest();
-    let cache_root = paths::cargo_home().join("cache/cargo-cas-v0");
+    let cache_root = paths::cargo_home().join("cache/cargo-cas-v1");
     let first_access = cache_root
         .join("access")
         .join(first_manifest.parent().unwrap().file_name().unwrap());

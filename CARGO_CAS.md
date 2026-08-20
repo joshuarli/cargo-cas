@@ -575,6 +575,21 @@ unchanged version banner while changing code generation, and a sysroot can
 provide compilation inputs not represented in that banner. The corresponding
 regression test uses two such shims and requires a cache miss.
 
+## Cache format V1
+
+The current experiment stores entries under
+`$CARGO_HOME/cache/cargo-cas-v1`. A manifest records its format version and
+ActionKey, plus a separately validated identity containing the package ID,
+target/crate, compile mode, full toolchain identity (compiler path, `-vV`, and
+sysroot), and direct dependency ActionKeys. Artifact paths remain relative to
+the entry; each artifact has a role, filename, size, and BLAKE3 digest.
+
+The duplicate identity is intentionally not an alternate lookup key. It lets a
+reader reject malformed, stale, or locally modified metadata before it copies
+an artifact into Cargo's ordinary build directory. Changing the required
+manifest schema creates a new cache-format directory rather than trying to
+interpret an older entry permissively.
+
 If artifacts are not relocatable, record the exact rustc/Cargo path input that
 requires remapping or exclusion. Do not paper over it by copying arbitrary
 workspace metadata into the global entry.

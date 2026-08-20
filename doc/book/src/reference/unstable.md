@@ -1691,7 +1691,7 @@ cargo clean gc -Zgc --max-git-size=0 --max-download-size=100MB
 
 The `-Zcargo-cas` flag enables the experimental, macOS-only immutable
 compiled-artifact cache. Cargo may reuse a verified dependency compilation
-from `$CARGO_HOME/cache/cargo-cas-v0` when its complete semantic action key
+from `$CARGO_HOME/cache/cargo-cas-v1` when its complete semantic action key
 matches. The feature is opt-in: without this flag, Cargo's normal compilation
 and freshness behavior is unchanged.
 

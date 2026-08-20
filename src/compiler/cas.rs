@@ -21,8 +21,8 @@ use super::job_queue::Work;
 use super::{BuildRunner, CompileMode, CrateType, FileFlavor, Lto, Unit};
 use crate::util::CargoResult;
 
-const CACHE_FORMAT_VERSION: u8 = 0;
-const CACHE_DIRECTORY: &str = "cargo-cas-v0";
+const CACHE_FORMAT_VERSION: u8 = 1;
+const CACHE_DIRECTORY: &str = "cargo-cas-v1";
 const MANIFEST_FILE: &str = "manifest.json";
 const ARTIFACTS_DIRECTORY: &str = "artifacts";
 const LOCKS_DIRECTORY: &str = "locks";
@@ -48,7 +48,7 @@ impl ActionKey {
 #[derive(Clone, Debug)]
 pub(crate) struct CacheEntry {
     root: PathBuf,
-    manifest: CacheManifestV0,
+    manifest: CacheManifestV1,
 }
 
 /// The global identity and local output shape of one cacheable compilation.
@@ -57,6 +57,7 @@ pub(crate) struct CacheEntry {
 #[derive(Clone)]
 pub(crate) struct CacheAction {
     key: ActionKey,
+    identity: ManifestIdentityV1,
     cache: PathBuf,
     artifacts: Vec<ArtifactPath>,
 }
@@ -67,6 +68,7 @@ pub(crate) struct CacheAction {
 #[derive(Clone)]
 pub(crate) struct CachePublication {
     key: ActionKey,
+    identity: ManifestIdentityV1,
     cache: PathBuf,
     package_root: PathBuf,
     build_root: PathBuf,
@@ -81,13 +83,7 @@ struct CacheKeyInputV0<'a> {
     mode: &'static str,
     profile: &'a crate::workspace::profiles::Profile,
     lto: LtoInput,
-    /// `rustc -vV` is not sufficient when two executable paths deliberately
-    /// report the same version while compiling differently.
-    rustc_path: String,
-    rustc_verbose_version: &'a str,
-    /// The sysroot can contribute crates and linker inputs not represented by
-    /// the compiler's version banner alone.
-    sysroot: String,
+    toolchain: ToolchainInput,
     rustflags: &'a [String],
     extra_args: &'a [String],
     features: Vec<String>,
@@ -137,6 +133,30 @@ struct DependencyInput {
     nounused: bool,
 }
 
+/// The compiler context must be recorded explicitly because `rustc -vV` is
+/// not sufficient when two executable paths deliberately report the same
+/// version while compiling differently. The sysroot may likewise contribute
+/// crates and linker inputs not represented by the version banner.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct ToolchainInput {
+    rustc_path: String,
+    rustc_verbose_version: String,
+    sysroot: String,
+}
+
+/// Human-inspectable identity duplicated in an entry manifest. The ActionKey
+/// remains the lookup identity; these fields make a corrupt or incompatible
+/// manifest self-describing and independently rejectable.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct ManifestIdentityV1 {
+    package_id: String,
+    target_name: String,
+    crate_name: String,
+    compile_mode: String,
+    toolchain: ToolchainInput,
+    dependency_action_keys: Vec<String>,
+}
+
 #[derive(Serialize)]
 enum LtoInput {
     Run(Option<String>),
@@ -147,9 +167,10 @@ enum LtoInput {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct CacheManifestV0 {
+struct CacheManifestV1 {
     format_version: u8,
     action_key: String,
+    identity: ManifestIdentityV1,
     artifacts: Vec<CachedArtifact>,
 }
 
@@ -199,8 +220,17 @@ pub(crate) fn prepare(
             return Ok(None);
         }
     };
+    let Some(identity) = manifest_identity(build_runner, unit) else {
+        debug!(
+            package = %unit.pkg.package_id(),
+            target = %unit.target.name(),
+            "cargo-cas skip: manifest identity could not be represented"
+        );
+        return Ok(None);
+    };
     Ok(Some(CacheAction {
         key,
+        identity,
         cache: cache_root(build_runner),
         artifacts: artifact_paths(build_runner, unit)?,
     }))
@@ -223,7 +253,7 @@ impl CacheAction {
             );
             return None;
         };
-        let Ok(manifest) = serde_json::from_slice::<CacheManifestV0>(&manifest_bytes) else {
+        let Ok(manifest) = serde_json::from_slice::<CacheManifestV1>(&manifest_bytes) else {
             warn!(path = %manifest_path.display(), "ignoring malformed cargo-cas cache manifest");
             debug!(
                 key = self.key.as_str(),
@@ -234,6 +264,7 @@ impl CacheAction {
 
         if manifest.format_version != CACHE_FORMAT_VERSION
             || manifest.action_key != self.key.as_str()
+            || manifest.identity != self.identity
         {
             warn!(path = %manifest_path.display(), "ignoring incompatible cargo-cas cache manifest");
             debug!(
@@ -370,8 +401,12 @@ pub(crate) fn publication(
     let Some(key) = action_key(build_runner, unit) else {
         return Ok(None);
     };
+    let Some(identity) = manifest_identity(build_runner, unit) else {
+        return Ok(None);
+    };
     Ok(Some(CachePublication {
         key,
+        identity,
         cache: cache_root(build_runner),
         package_root: unit.pkg.root().to_path_buf(),
         build_root: build_runner.bcx.ws.build_dir().into_path_unlocked(),
@@ -423,7 +458,7 @@ impl CachePublication {
 
         let final_entry = self.cache.join(self.key.as_str());
         if fs::symlink_metadata(&final_entry).is_ok() {
-            if entry_is_valid(&final_entry, &self.key, &self.artifacts) {
+            if entry_is_valid(&final_entry, &self.key, &self.identity, &self.artifacts) {
                 mark_used(&self.cache, self.key.as_str());
                 return Ok(());
             }
@@ -460,16 +495,17 @@ impl CachePublication {
             });
         }
 
-        let manifest = CacheManifestV0 {
+        let manifest = CacheManifestV1 {
             format_version: CACHE_FORMAT_VERSION,
             action_key: self.key.0.clone(),
+            identity: self.identity.clone(),
             artifacts: manifest_artifacts,
         };
         paths::write_atomic(
             temporary_entry.join(MANIFEST_FILE),
             serde_json::to_vec(&manifest)?,
         )?;
-        if !entry_is_valid(&temporary_entry, &self.key, &self.artifacts) {
+        if !entry_is_valid(&temporary_entry, &self.key, &self.identity, &self.artifacts) {
             let _ = fs::remove_dir_all(&temporary_entry);
             return Err(io::Error::other("staged cargo-cas entry failed validation").into());
         }
@@ -537,13 +573,7 @@ fn action_key_inner(
         .extra_args_for(unit)
         .map(Vec::as_slice)
         .unwrap_or_default();
-    let rustc_path = paths::resolve_executable(&build_runner.bcx.rustc().path)
-        .ok()?
-        .canonicalize()
-        .ok()?
-        .to_str()?
-        .to_owned();
-    let sysroot = build_runner.bcx.get_sysroot().to_str()?.to_owned();
+    let toolchain = toolchain_input(build_runner)?;
     let input = CacheKeyInputV0 {
         format_version: CACHE_FORMAT_VERSION,
         package: PackageInput {
@@ -570,9 +600,7 @@ fn action_key_inner(
         },
         profile: &unit.profile,
         lto: lto_input(build_runner.lto[unit]),
-        rustc_path,
-        rustc_verbose_version: &build_runner.bcx.rustc().verbose_version,
-        sysroot,
+        toolchain,
         rustflags: &unit.rustflags,
         extra_args,
         features: unit
@@ -584,6 +612,45 @@ fn action_key_inner(
     };
     let bytes = serde_json::to_vec(&input).ok()?;
     Some(ActionKey(blake3::hash(&bytes).to_hex().to_string()))
+}
+
+fn manifest_identity(
+    build_runner: &BuildRunner<'_, '_>,
+    unit: &Unit,
+) -> Option<ManifestIdentityV1> {
+    let mut dependency_action_keys = build_runner
+        .unit_deps(unit)
+        .iter()
+        .map(|dependency| action_key(build_runner, &dependency.unit).map(|key| key.0))
+        .collect::<Option<Vec<_>>>()?;
+    dependency_action_keys.sort_unstable();
+    Some(ManifestIdentityV1 {
+        package_id: unit.pkg.package_id().to_string(),
+        target_name: unit.target.name().to_owned(),
+        crate_name: unit.target.crate_name(),
+        compile_mode: match unit.mode {
+            CompileMode::Check { test: false } => "check",
+            CompileMode::Build => "build",
+            _ => return None,
+        }
+        .to_owned(),
+        toolchain: toolchain_input(build_runner)?,
+        dependency_action_keys,
+    })
+}
+
+fn toolchain_input(build_runner: &BuildRunner<'_, '_>) -> Option<ToolchainInput> {
+    let rustc_path = paths::resolve_executable(&build_runner.bcx.rustc().path)
+        .ok()?
+        .canonicalize()
+        .ok()?
+        .to_str()?
+        .to_owned();
+    Some(ToolchainInput {
+        rustc_path,
+        rustc_verbose_version: build_runner.bcx.rustc().verbose_version.clone(),
+        sysroot: build_runner.bcx.get_sysroot().to_str()?.to_owned(),
+    })
 }
 
 fn eligible_without_dependencies(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> bool {
@@ -903,7 +970,7 @@ fn mark_used(cache: &Path, key: &str) {
     }
 }
 
-fn validate_manifest(root: &Path, manifest: &CacheManifestV0) -> bool {
+fn validate_manifest(root: &Path, manifest: &CacheManifestV1) -> bool {
     if !is_plain_directory(root) || !is_plain_directory(&root.join(ARTIFACTS_DIRECTORY)) {
         return false;
     }
@@ -925,7 +992,12 @@ fn validate_manifest(root: &Path, manifest: &CacheManifestV0) -> bool {
 /// Checks every entry component before accepting a cache hit.  The manifest
 /// only stores relative artifact names, but a symlink at the entry boundary or
 /// in its artifact set could otherwise redirect Cargo outside its cache root.
-fn entry_is_valid(root: &Path, key: &ActionKey, expected: &[ArtifactPath]) -> bool {
+fn entry_is_valid(
+    root: &Path,
+    key: &ActionKey,
+    identity: &ManifestIdentityV1,
+    expected: &[ArtifactPath],
+) -> bool {
     if !is_plain_directory(root) {
         return false;
     }
@@ -933,11 +1005,12 @@ fn entry_is_valid(root: &Path, key: &ActionKey, expected: &[ArtifactPath]) -> bo
     let Ok(manifest_bytes) = read_regular_file(&manifest_path) else {
         return false;
     };
-    let Ok(manifest) = serde_json::from_slice::<CacheManifestV0>(&manifest_bytes) else {
+    let Ok(manifest) = serde_json::from_slice::<CacheManifestV1>(&manifest_bytes) else {
         return false;
     };
     manifest.format_version == CACHE_FORMAT_VERSION
         && manifest.action_key == key.as_str()
+        && manifest.identity == *identity
         && validate_manifest(root, &manifest)
         && manifest_matches_expected(&manifest, expected)
 }
@@ -982,7 +1055,7 @@ fn open_regular_file(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
-fn manifest_matches_expected(manifest: &CacheManifestV0, expected: &[ArtifactPath]) -> bool {
+fn manifest_matches_expected(manifest: &CacheManifestV1, expected: &[ArtifactPath]) -> bool {
     manifest.artifacts.len() == expected.len()
         && manifest
             .artifacts
