@@ -1787,6 +1787,99 @@ edition = "2024"
 }
 
 #[cargo_test]
+fn unavailable_or_substituted_cache_root_falls_back_without_escaping_cargo_home() {
+    const PACKAGE: &str = "cas-cache-root-fallback-dep";
+    const CRATE: &str = "cas_cache_root_fallback_dep";
+
+    registry::init();
+    Package::new(PACKAGE, "1.0.0")
+        .edition("2024")
+        .file("src/lib.rs", "pub fn answer() {}\n")
+        .publish();
+    let manifest = format!(
+        r#"[package]
+name = "cas-cache-root-fallback-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+{PACKAGE} = "1.0.0"
+"#,
+    );
+    let unavailable = project_in("cas-cache-root-unavailable")
+        .file("Cargo.toml", &manifest)
+        .file(
+            "src/main.rs",
+            "fn main() { cas_cache_root_fallback_dep::answer(); }\n",
+        )
+        .build();
+    let recovered = project_in("cas-cache-root-recovered")
+        .file("Cargo.toml", &manifest)
+        .file(
+            "src/main.rs",
+            "fn main() { cas_cache_root_fallback_dep::answer(); }\n",
+        )
+        .build();
+    let hit = project_in("cas-cache-root-hit")
+        .file("Cargo.toml", &manifest)
+        .file(
+            "src/main.rs",
+            "fn main() { cas_cache_root_fallback_dep::answer(); }\n",
+        )
+        .build();
+
+    let cache = paths::cargo_home().join("cache/cargo-cas-v1");
+    fs::create_dir_all(cache.parent().unwrap()).unwrap();
+    let outside = paths::root().join("outside-cargo-cas-root");
+    fs::create_dir_all(&outside).unwrap();
+    symlink(&outside, &cache).unwrap();
+
+    let mut malformed_gc = unavailable.cargo("clean gc -Zgc --max-cas-size=0");
+    malformed_gc.masquerade_as_nightly_cargo(&["gc"]);
+    let malformed_gc_output = malformed_gc.build_command().output().unwrap();
+    assert!(
+        !malformed_gc_output.status.success(),
+        "GC must reject a substituted cache root instead of traversing it"
+    );
+    assert!(
+        String::from_utf8_lossy(&malformed_gc_output.stderr)
+            .contains("cargo-cas cache root is not a directory"),
+        "GC should clearly identify the malformed cache root:\n{}",
+        String::from_utf8_lossy(&malformed_gc_output.stderr)
+    );
+    assert!(fs::read_dir(&outside).unwrap().next().is_none());
+
+    let unavailable_output = run_check(
+        &unavailable,
+        &paths::root().join("cas-cache-root-unavailable-target"),
+        "",
+    );
+    assert!(
+        crate_was_compiled(&unavailable_output, CRATE),
+        "an unavailable cache root must fall back to normal rustc:\n{}",
+        String::from_utf8_lossy(&unavailable_output.stderr)
+    );
+    assert!(
+        fs::read_dir(&outside).unwrap().next().is_none(),
+        "cache locks, staging, and artifacts must never be created through a substituted root"
+    );
+
+    fs::remove_file(&cache).unwrap();
+    let recovered_output = run_check(
+        &recovered,
+        &paths::root().join("cas-cache-root-recovered-target"),
+        "",
+    );
+    assert!(crate_was_compiled(&recovered_output, CRATE));
+    let hit_output = run_check(&hit, &paths::root().join("cas-cache-root-hit-target"), "");
+    assert!(
+        !crate_was_compiled(&hit_output, CRATE),
+        "a recovered ordinary cache root must publish a reusable entry:\n{}",
+        String::from_utf8_lossy(&hit_output.stderr)
+    );
+}
+
+#[cargo_test]
 fn concurrent_same_key_compiles_once_and_waiters_restore() {
     const PACKAGE: &str = "cas-gate-five-same";
     const CRATE: &str = "cas_gate_five_same";

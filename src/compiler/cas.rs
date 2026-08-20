@@ -342,6 +342,11 @@ impl CacheAction {
     /// A lock-free hit check. Immutable entries are published by atomic rename,
     /// so readers never need to serialize with other readers.
     pub(crate) fn lookup(&self) -> Option<CacheEntry> {
+        if !is_plain_directory(&self.cache) {
+            self.stats.miss();
+            debug!(path = %self.cache.display(), "cargo-cas miss: cache root unavailable");
+            return None;
+        }
         let root = self.cache.join(self.key.as_str());
         if !is_plain_directory(&root) {
             self.stats.miss();
@@ -481,6 +486,7 @@ impl CacheAction {
     }
 
     fn lock(&self) -> io::Result<File> {
+        ensure_cache_root(&self.cache)?;
         let lock_path = self
             .cache
             .join(LOCKS_DIRECTORY)
@@ -560,6 +566,8 @@ impl CachePublication {
             debug!("cargo-cas skips unit with fingerprinted environment");
             return Ok(());
         }
+
+        ensure_cache_root(&self.cache)?;
 
         if self
             .artifacts
@@ -1108,6 +1116,14 @@ struct CacheGcEntry {
 }
 
 fn cache_entries(root: &Path) -> CargoResult<Vec<CacheGcEntry>> {
+    match fs::symlink_metadata(root) {
+        Ok(metadata) if !metadata.file_type().is_dir() => {
+            return Err(io::Error::other("cargo-cas cache root is not a directory").into());
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+        Ok(_) => {}
+    }
     let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -1200,6 +1216,34 @@ fn mark_used(cache: &Path, key: &str) {
     })();
     if let Err(error) = result {
         debug!(error = ?error, "failed to record cargo-cas last use");
+    }
+}
+
+/// Creates the experimental cache root only when its final component is an
+/// ordinary directory. In particular, never follow a symlink substituted at
+/// `$CARGO_HOME/cache/cargo-cas-v1`: cache infrastructure failure must fall
+/// back to normal compilation, not redirect locks or staged artifacts outside
+/// the configured Cargo home.
+fn ensure_cache_root(cache: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(cache) {
+        Ok(metadata) if metadata.file_type().is_dir() => return Ok(()),
+        Ok(_) => return Err(io::Error::other("cargo-cas cache root is not a directory")),
+        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+        Err(_) => {}
+    }
+    let parent = cache
+        .parent()
+        .expect("cargo-cas cache root has a cache-directory parent");
+    fs::create_dir_all(parent)?;
+    match fs::create_dir(cache) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    if is_plain_directory(cache) {
+        Ok(())
+    } else {
+        Err(io::Error::other("cargo-cas cache root is not a directory"))
     }
 }
 

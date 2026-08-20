@@ -652,6 +652,19 @@ cache hit immediately after `.rmeta` transport and observes the dependent
 root's rustc proxy start before linkable/dep-info transport is released. The
 same test also keeps the normal build/artifact-dir behavior covered.
 
+## Cache-infrastructure failure boundary
+
+The cache root itself is checked with `symlink_metadata` before lookup,
+per-ActionKey locking, publication, and GC. A missing directory is created as
+an ordinary directory; a regular file, permission error, or substituted
+symlink makes that action a normal local compile and logs the cache failure at
+debug/warn level. Publication is still best effort, so an I/O failure such as
+disk exhaustion after successful rustc work cannot turn a valid Cargo build
+into a cache-only failure. `cargo clean gc` refuses a malformed root instead
+of traversing it. The integration regression substitutes the root with a
+symlink to an outside sentinel, proves no locks/staging/artifacts escape into
+that directory, then removes it and proves normal publish/hit recovery.
+
 ## Exact archaeology commands and checks
 
 The following read-only commands were used for this document:
