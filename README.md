@@ -76,6 +76,26 @@ With `cargo` already installed, you can simply run:
 cargo build --release
 ```
 
+To use this checkout's release binary as your local `cargo` without replacing
+rustup's managed files:
+
+```sh
+make install
+export PATH="$HOME/.cargo-cas/bin:$PATH"
+```
+
+With Homebrew's rustup distribution, keep its tool proxies after the local
+prefix, for example:
+
+```sh
+export PATH="$HOME/.cargo-cas/bin:$(brew --prefix rustup)/bin:$HOME/.cargo/bin:$PATH"
+```
+
+The installed binary enables the cargo-cas cache by default; `-Zcargo-cas` is
+still accepted for compatibility. Select the rustup toolchain with
+`RUSTUP_TOOLCHAIN=...` or a project override; a locally shadowed Cargo binary
+no longer receives rustup's `cargo +toolchain` proxy syntax.
+
 ## Adding new subcommands to Cargo
 
 Cargo is designed to be extensible with new subcommands without having to modify
@@ -126,4 +146,3 @@ which can be obtained from the [upstream repository][1].
 See [LICENSE-THIRD-PARTY](LICENSE-THIRD-PARTY) for details.
 
 [1]: https://github.com/libgit2/libgit2
-

@@ -839,6 +839,14 @@ macro_rules! unstable_cli_options {
                 };
 
                 unstable.build_dir_new_layout = !is_new_build_dir_layout_opt_out();
+                #[cfg(feature = "cargo-cas-default")]
+                {
+                    // The locally installed cargo-cas binary is a forked
+                    // Cargo, so its immutable artifact cache is on by
+                    // default. Upstream Cargo builds do not enable this
+                    // package feature and retain the normal opt-in gate.
+                    unstable.cargo_cas = true;
+                }
 
                 return unstable;
             }
@@ -861,6 +869,15 @@ macro_rules! unstable_cli_options {
                 let expected = format!("{:#?}", expected);
                 let actual = format!("{:#?}", vec![$(stringify!($element)),*]);
                 snapbox::assert_data_eq!(actual, expected);
+            }
+
+            #[test]
+            fn cargo_cas_default_matches_build_mode() {
+                #[cfg(feature = "cargo-cas-default")]
+                assert!(super::CliUnstable::default().cargo_cas);
+
+                #[cfg(not(feature = "cargo-cas-default"))]
+                assert!(!super::CliUnstable::default().cargo_cas);
             }
         }
     }
