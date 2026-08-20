@@ -1687,6 +1687,33 @@ cargo clean gc -Zgc --max-download-age=1week
 cargo clean gc -Zgc --max-git-size=0 --max-download-size=100MB
 ```
 
+## cargo-cas
+
+The `-Zcargo-cas` flag enables the experimental, macOS-only immutable
+compiled-artifact cache. Cargo may reuse a verified dependency compilation
+from `$CARGO_HOME/cache/cargo-cas-v0` when its complete semantic action key
+matches. The feature is opt-in: without this flag, Cargo's normal compilation
+and freshness behavior is unchanged.
+
+V0 is deliberately conservative. It only considers host `lib`/`rlib` units
+from immutable registry or resolved Git sources, and excludes workspace/path
+sources, build scripts and their affected units, proc macros and their
+dependents, native linking, incremental compilation, wrappers, examples, and
+non-`check`/`build` modes. Any uncertainty is a normal local compilation, not
+a cache hit.
+
+To inspect decisions without changing normal Cargo output, enable debug
+tracing:
+
+```sh
+CARGO_LOG=cargo::compiler::cas=debug cargo check -Zcargo-cas
+```
+
+The log records `cargo-cas hit`, `cargo-cas miss`, `cargo-cas reject`, and
+`cargo-cas skip` events, including the reason for conservative skips. A miss
+or cache-infrastructure failure is only a performance cost: Cargo falls back
+to its ordinary compiler work.
+
 ## open-namespaces
 
 * Tracking Issue: [#13576](https://github.com/rust-lang/cargo/issues/13576)

@@ -29,6 +29,16 @@ fn run_check(project: &Project, target_dir: &Path, extra: &str) -> RawOutput {
     cargo.run()
 }
 
+fn run_check_with_cas_log(project: &Project, target_dir: &Path) -> RawOutput {
+    let mut cargo = project.cargo("check -Zcargo-cas -vv");
+    cargo
+        .arg("--target-dir")
+        .arg(target_dir)
+        .env("CARGO_LOG", "cargo::compiler::cas=debug")
+        .masquerade_as_nightly_cargo(&["cargo-cas"]);
+    cargo.run()
+}
+
 fn run_build(project: &Project, target_dir: &Path) -> RawOutput {
     let mut cargo = project.cargo("build -Zcargo-cas -vv");
     cargo
@@ -322,6 +332,99 @@ edition = "2024"
         crate_was_compiled(&output, "local_dependency"),
         "path sources are ineligible and must run normal rustc:\n{}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cargo_test]
+fn debug_logging_explains_cargo_cas_hit_miss_and_skip_decisions() {
+    const PACKAGE: &str = "cas-observability-dep";
+    const CRATE: &str = "cas_observability_dep";
+
+    registry::init();
+    Package::new(PACKAGE, "1.0.0")
+        .edition("2024")
+        .file("src/lib.rs", "pub fn answer() {}\n")
+        .publish();
+
+    let manifest = format!(
+        r#"[package]
+name = "cas-observability-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+{PACKAGE} = "1.0.0"
+"#,
+    );
+    let first = project_in("cas-observability-first")
+        .file("Cargo.toml", &manifest)
+        .file(
+            "src/main.rs",
+            "fn main() { cas_observability_dep::answer(); }\n",
+        )
+        .build();
+    let second = project_in("cas-observability-second")
+        .file("Cargo.toml", &manifest)
+        .file(
+            "src/main.rs",
+            "fn main() { cas_observability_dep::answer(); }\n",
+        )
+        .build();
+    let path_source = project_in("cas-observability-path")
+        .file(
+            "Cargo.toml",
+            r#"[package]
+name = "cas-observability-path"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+local-dependency = { path = "local-dependency" }
+"#,
+        )
+        .file("src/main.rs", "fn main() { local_dependency::answer(); }\n")
+        .file(
+            "local-dependency/Cargo.toml",
+            r#"[package]
+name = "local-dependency"
+version = "0.1.0"
+edition = "2024"
+"#,
+        )
+        .file("local-dependency/src/lib.rs", "pub fn answer() {}\n")
+        .build();
+
+    let first_output = run_check_with_cas_log(
+        &first,
+        &paths::root().join("cas-observability-first-target"),
+    );
+    assert!(crate_was_compiled(&first_output, CRATE));
+    assert!(
+        String::from_utf8_lossy(&first_output.stderr).contains("cargo-cas miss: entry absent"),
+        "an eligible cold unit must report an actionable miss:\n{}",
+        String::from_utf8_lossy(&first_output.stderr)
+    );
+
+    let second_output = run_check_with_cas_log(
+        &second,
+        &paths::root().join("cas-observability-second-target"),
+    );
+    assert!(!crate_was_compiled(&second_output, CRATE));
+    assert!(
+        String::from_utf8_lossy(&second_output.stderr).contains("cargo-cas hit"),
+        "an eligible warm unit must report a cache hit:\n{}",
+        String::from_utf8_lossy(&second_output.stderr)
+    );
+
+    let skip_output = run_check_with_cas_log(
+        &path_source,
+        &paths::root().join("cas-observability-path-target"),
+    );
+    assert!(crate_was_compiled(&skip_output, "local_dependency"));
+    assert!(
+        String::from_utf8_lossy(&skip_output.stderr).contains("cargo-cas skip: path source"),
+        "an ineligible unit must report why it was skipped:\n{}",
+        String::from_utf8_lossy(&skip_output.stderr)
     );
 }
 
