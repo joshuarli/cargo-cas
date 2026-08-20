@@ -3,6 +3,9 @@
 use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::Path;
+use std::process::{Child, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::prelude::*;
 use cargo_test_support::registry::{self, Package};
@@ -69,6 +72,92 @@ fn cache_manifest() -> std::path::PathBuf {
         .map(|entry| entry.path().join("manifest.json"))
         .find(|manifest| manifest.is_file())
         .expect("a successful eligible check publishes a cargo-cas manifest")
+}
+
+fn gated_rustc(name: &str) -> std::path::PathBuf {
+    let path = paths::root().join(name);
+    fs::write(
+        &path,
+        r#"#!/bin/sh
+previous=''
+for argument in "$@"; do
+    if [ "$previous" = '--crate-name' ] && [ "$argument" = "$CAS_TRIGGER_CRATE" ]; then
+        printf '%s\n' "$argument" >> "$CAS_LOG"
+        while [ ! -f "$CAS_RELEASE" ]; do sleep 0.02; done
+        break
+    fi
+    previous="$argument"
+done
+exec rustc "$@"
+"#,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).unwrap();
+    }
+    path
+}
+
+fn start_gated_check(
+    project: &Project,
+    target_dir: &Path,
+    rustc: &Path,
+    trigger_crate: &str,
+    log: &Path,
+    release: &Path,
+) -> Child {
+    let mut cargo = project.cargo("check -Zcargo-cas -vv");
+    cargo
+        .arg("--target-dir")
+        .arg(target_dir)
+        .env("RUSTC", rustc)
+        .env("CAS_TRIGGER_CRATE", trigger_crate)
+        .env("CAS_LOG", log)
+        .env("CAS_RELEASE", release)
+        .masquerade_as_nightly_cargo(&["cargo-cas"]);
+    cargo
+        .build_command()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+fn wait_for_log_line(log: &Path, line: &str) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .any(|candidate| candidate == line)
+        {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
+
+fn wait_for_log_lines(log: &Path, lines: usize) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if fs::read_to_string(log).unwrap_or_default().lines().count() >= lines {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
+
+fn wait_for_child(child: Child) -> Output {
+    thread::spawn(move || child.wait_with_output().unwrap())
+        .join()
+        .unwrap()
 }
 
 #[cargo_test]
@@ -438,5 +527,164 @@ edition = "2024"
         !crate_was_compiled(&recovered_output, CRATE),
         "a repaired partial entry should be reusable:\n{}",
         String::from_utf8_lossy(&recovered_output.stderr)
+    );
+}
+
+#[cargo_test]
+fn concurrent_same_key_compiles_once_and_waiters_restore() {
+    const PACKAGE: &str = "cas-gate-five-same";
+    const CRATE: &str = "cas_gate_five_same";
+
+    registry::init();
+    Package::new(PACKAGE, "1.0.0")
+        .edition("2024")
+        .file("src/lib.rs", "pub fn answer() {}\n")
+        .publish();
+
+    let manifest = format!(
+        r#"[package]
+name = "cas-gate-five-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+{PACKAGE} = "1.0.0"
+"#,
+    );
+    let first = project_in("cas-gate-five-same-first")
+        .file("Cargo.toml", &manifest)
+        .file(
+            "src/main.rs",
+            "fn main() { cas_gate_five_same::answer(); }\n",
+        )
+        .build();
+    let second = project_in("cas-gate-five-same-second")
+        .file("Cargo.toml", &manifest)
+        .file(
+            "src/main.rs",
+            "fn main() { cas_gate_five_same::answer(); }\n",
+        )
+        .build();
+
+    let rustc = gated_rustc("cas-gate-five-rustc");
+    let log = paths::root().join("cas-gate-five-same.log");
+    let release = paths::root().join("cas-gate-five-same.release");
+    let first_child = start_gated_check(
+        &first,
+        &paths::root().join("cas-gate-five-same-first-target"),
+        &rustc,
+        CRATE,
+        &log,
+        &release,
+    );
+    assert!(wait_for_log_line(&log, CRATE));
+    let second_child = start_gated_check(
+        &second,
+        &paths::root().join("cas-gate-five-same-second-target"),
+        &rustc,
+        CRATE,
+        &log,
+        &release,
+    );
+
+    // Without a per-key recheck both processes reach this gate and append a
+    // second line. The first compiler remains paused long enough for a second
+    // cache miss to contend on the same ActionKey lock.
+    let duplicate_compiler_started = wait_for_log_lines(&log, 2);
+    fs::write(&release, "release").unwrap();
+    let first_output = wait_for_child(first_child);
+    let second_output = wait_for_child(second_child);
+    assert!(first_output.status.success(), "{first_output:?}");
+    assert!(second_output.status.success(), "{second_output:?}");
+    assert!(
+        !duplicate_compiler_started,
+        "same-key concurrent cache misses started more than one rustc: {}",
+        fs::read_to_string(&log).unwrap_or_default()
+    );
+    assert_eq!(fs::read_to_string(&log).unwrap().lines().count(), 1);
+}
+
+#[cargo_test]
+fn concurrent_different_keys_do_not_serialize() {
+    const LEFT_PACKAGE: &str = "cas-gate-five-left";
+    const LEFT_CRATE: &str = "cas_gate_five_left";
+    const RIGHT_PACKAGE: &str = "cas-gate-five-right";
+    const RIGHT_CRATE: &str = "cas_gate_five_right";
+
+    registry::init();
+    for (package, crate_name) in [(LEFT_PACKAGE, LEFT_CRATE), (RIGHT_PACKAGE, RIGHT_CRATE)] {
+        Package::new(package, "1.0.0")
+            .edition("2024")
+            .file("src/lib.rs", "pub fn answer() {}\n")
+            .publish();
+        assert!(crate_name.starts_with("cas_gate_five_"));
+    }
+
+    let left_manifest = format!(
+        r#"[package]
+name = "cas-gate-five-left-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+{LEFT_PACKAGE} = "1.0.0"
+"#,
+    );
+    let right_manifest = format!(
+        r#"[package]
+name = "cas-gate-five-right-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+{RIGHT_PACKAGE} = "1.0.0"
+"#,
+    );
+    let left = project_in("cas-gate-five-left")
+        .file("Cargo.toml", &left_manifest)
+        .file(
+            "src/main.rs",
+            "fn main() { cas_gate_five_left::answer(); }\n",
+        )
+        .build();
+    let right = project_in("cas-gate-five-right")
+        .file("Cargo.toml", &right_manifest)
+        .file(
+            "src/main.rs",
+            "fn main() { cas_gate_five_right::answer(); }\n",
+        )
+        .build();
+
+    let rustc = gated_rustc("cas-gate-five-different-rustc");
+    let log = paths::root().join("cas-gate-five-different.log");
+    let release = paths::root().join("cas-gate-five-different.release");
+    let left_child = start_gated_check(
+        &left,
+        &paths::root().join("cas-gate-five-left-target"),
+        &rustc,
+        LEFT_CRATE,
+        &log,
+        &release,
+    );
+    let right_child = start_gated_check(
+        &right,
+        &paths::root().join("cas-gate-five-right-target"),
+        &rustc,
+        RIGHT_CRATE,
+        &log,
+        &release,
+    );
+
+    let left_started = wait_for_log_line(&log, LEFT_CRATE);
+    let right_started = wait_for_log_line(&log, RIGHT_CRATE);
+    fs::write(&release, "release").unwrap();
+    let left_output = wait_for_child(left_child);
+    let right_output = wait_for_child(right_child);
+    assert!(left_output.status.success(), "{left_output:?}");
+    assert!(right_output.status.success(), "{right_output:?}");
+    assert!(
+        left_started && right_started,
+        "different ActionKeys serialized: {}",
+        fs::read_to_string(&log).unwrap_or_default()
     );
 }

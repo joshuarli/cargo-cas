@@ -217,14 +217,18 @@ fn compile<'gctx>(
             let force = exec.force_rebuild(unit) || force_rebuild;
             let mut job = fingerprint::prepare_target(build_runner, unit, force)?;
             job.before(if job.freshness().is_dirty() {
-                let cache_entry = if !force {
-                    cas::lookup(build_runner, unit)?
-                } else {
-                    None
-                };
-                let work = if let Some(entry) = cache_entry {
+                let cache_action = cas::prepare(build_runner, unit)?;
+                let work = if let Some(action) = cache_action {
                     let normal_work = rustc(build_runner, unit, exec)?;
-                    cas::restore_or_compile(build_runner, unit, entry, normal_work)?
+                    if !force {
+                        if let Some(entry) = action.lookup() {
+                            action.restore_or_compile(entry, normal_work)
+                        } else {
+                            action.coordinate(normal_work, true)
+                        }
+                    } else {
+                        action.coordinate(normal_work, false)
+                    }
                 } else if unit.mode.is_doc() || unit.mode.is_doc_scrape() {
                     rustdoc(build_runner, unit)?
                 } else {

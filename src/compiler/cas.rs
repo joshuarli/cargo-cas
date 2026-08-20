@@ -24,6 +24,7 @@ const CACHE_FORMAT_VERSION: u8 = 0;
 const CACHE_DIRECTORY: &str = "cargo-cas-v0";
 const MANIFEST_FILE: &str = "manifest.json";
 const ARTIFACTS_DIRECTORY: &str = "artifacts";
+const LOCKS_DIRECTORY: &str = "locks";
 
 static TEMPORARY_ENTRY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -46,6 +47,16 @@ impl ActionKey {
 pub(crate) struct CacheEntry {
     root: PathBuf,
     manifest: CacheManifestV0,
+}
+
+/// The global identity and local output shape of one cacheable compilation.
+/// It owns no file descriptor: a per-key lock is opened only by active work,
+/// never while Cargo is constructing the complete unit graph.
+#[derive(Clone)]
+pub(crate) struct CacheAction {
+    key: ActionKey,
+    cache: PathBuf,
+    artifacts: Vec<ArtifactPath>,
 }
 
 /// The stable inputs needed to publish after the `rustc` work has completed.
@@ -146,102 +157,153 @@ struct ArtifactPath {
 /// All lookup failures are cache misses.  Cargo can still compile the unit in
 /// the normal way, which is safer than allowing cache infrastructure damage to
 /// prevent a valid build.
-pub(crate) fn lookup(
+pub(crate) fn prepare(
     build_runner: &BuildRunner<'_, '_>,
     unit: &Unit,
-) -> CargoResult<Option<CacheEntry>> {
+) -> CargoResult<Option<CacheAction>> {
     let Some(key) = action_key(build_runner, unit) else {
         return Ok(None);
     };
-    let root = cache_root(build_runner).join(key.as_str());
-    if !is_plain_directory(&root) {
-        return Ok(None);
-    }
-    let manifest_path = root.join(MANIFEST_FILE);
-    let Ok(manifest_bytes) = read_regular_file(&manifest_path) else {
-        return Ok(None);
-    };
-    let Ok(manifest) = serde_json::from_slice::<CacheManifestV0>(&manifest_bytes) else {
-        warn!(path = %manifest_path.display(), "ignoring malformed cargo-cas cache manifest");
-        return Ok(None);
-    };
-
-    if manifest.format_version != CACHE_FORMAT_VERSION || manifest.action_key != key.as_str() {
-        warn!(path = %manifest_path.display(), "ignoring incompatible cargo-cas cache manifest");
-        return Ok(None);
-    }
-    if !validate_manifest(&root, &manifest) {
-        warn!(path = %manifest_path.display(), "ignoring corrupt cargo-cas cache entry");
-        return Ok(None);
-    }
-    let expected = artifact_paths(build_runner, unit)?;
-    if !manifest_matches_expected(&manifest, &expected) {
-        warn!(path = %manifest_path.display(), "ignoring cargo-cas entry with unexpected artifacts");
-        return Ok(None);
-    }
-
-    Ok(Some(CacheEntry { root, manifest }))
+    Ok(Some(CacheAction {
+        key,
+        cache: cache_root(build_runner),
+        artifacts: artifact_paths(build_runner, unit)?,
+    }))
 }
 
-/// Returns work that materializes a validated entry at Cargo's usual output
-/// paths. This leaves `extern_args`, `-L` construction, local fingerprints,
-/// and final artifact uplift unchanged.
-///
-/// A hit can still disappear or become unreadable between lookup and the
-/// actual job. That is cache-infrastructure damage, so recover by running the
-/// already-prepared normal compiler work instead of failing Cargo.
-pub(crate) fn restore_or_compile(
-    build_runner: &BuildRunner<'_, '_>,
-    unit: &Unit,
-    entry: CacheEntry,
-    normal_work: Work,
-) -> CargoResult<Work> {
-    let expected = artifact_paths(build_runner, unit)?;
-    debug_assert!(manifest_matches_expected(&entry.manifest, &expected));
+impl CacheAction {
+    /// A lock-free hit check. Immutable entries are published by atomic rename,
+    /// so readers never need to serialize with other readers.
+    pub(crate) fn lookup(&self) -> Option<CacheEntry> {
+        let root = self.cache.join(self.key.as_str());
+        if !is_plain_directory(&root) {
+            return None;
+        }
+        let manifest_path = root.join(MANIFEST_FILE);
+        let Ok(manifest_bytes) = read_regular_file(&manifest_path) else {
+            return None;
+        };
+        let Ok(manifest) = serde_json::from_slice::<CacheManifestV0>(&manifest_bytes) else {
+            warn!(path = %manifest_path.display(), "ignoring malformed cargo-cas cache manifest");
+            return None;
+        };
 
-    let restores = entry
-        .manifest
-        .artifacts
-        .iter()
-        .zip(expected)
-        .map(|(cached, expected)| {
-            (
-                entry.root.join(ARTIFACTS_DIRECTORY).join(&cached.file),
-                expected.destination,
-                cached.role,
-            )
-        })
-        .collect::<Vec<_>>();
+        if manifest.format_version != CACHE_FORMAT_VERSION
+            || manifest.action_key != self.key.as_str()
+        {
+            warn!(path = %manifest_path.display(), "ignoring incompatible cargo-cas cache manifest");
+            return None;
+        }
+        if !validate_manifest(&root, &manifest) {
+            warn!(path = %manifest_path.display(), "ignoring corrupt cargo-cas cache entry");
+            return None;
+        }
+        if !manifest_matches_expected(&manifest, &self.artifacts) {
+            warn!(path = %manifest_path.display(), "ignoring cargo-cas entry with unexpected artifacts");
+            return None;
+        }
 
-    Ok(Work::new(move |state| {
-        let mut restored_rmeta = false;
-        let restored: CargoResult<()> = (|| {
-            for (source, destination, role) in restores {
-                let parent = destination.parent().expect("Cargo output path has parent");
-                paths::create_dir_all(parent)?;
-                // Cache entries are immutable. Copy rather than hardlink so a
-                // later local output cleanup or compiler invocation can never
-                // mutate a globally cached inode.
-                fs::copy(source, destination)?;
-                if role == ArtifactRole::Rmeta {
-                    restored_rmeta = true;
-                }
-            }
-            Ok(())
-        })();
-        match restored {
-            Ok(()) => {
-                if restored_rmeta {
-                    state.rmeta_produced();
+        Some(CacheEntry { root, manifest })
+    }
+
+    /// Returns work that materializes a validated entry at Cargo's usual
+    /// output paths. This leaves `extern_args`, `-L` construction, local
+    /// fingerprints, and final artifact uplift unchanged.
+    ///
+    /// A hit can still disappear or become unreadable between lookup and the
+    /// actual job. That is cache-infrastructure damage, so recover by running
+    /// the already-prepared normal compiler work instead of failing Cargo.
+    pub(crate) fn restore_or_compile(&self, entry: CacheEntry, normal_work: Work) -> Work {
+        debug_assert!(manifest_matches_expected(&entry.manifest, &self.artifacts));
+
+        let restores = entry
+            .manifest
+            .artifacts
+            .iter()
+            .zip(&self.artifacts)
+            .map(|(cached, expected)| {
+                (
+                    entry.root.join(ARTIFACTS_DIRECTORY).join(&cached.file),
+                    expected.destination.clone(),
+                    cached.role,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        Work::new(move |state| {
+            let mut restored_rmeta = false;
+            let restored: CargoResult<()> = (|| {
+                for (source, destination, role) in restores {
+                    let parent = destination.parent().expect("Cargo output path has parent");
+                    paths::create_dir_all(parent)?;
+                    // Cache entries are immutable. Copy rather than hardlink so a
+                    // later local output cleanup or compiler invocation can never
+                    // mutate a globally cached inode.
+                    fs::copy(source, destination)?;
+                    if role == ArtifactRole::Rmeta {
+                        restored_rmeta = true;
+                    }
                 }
                 Ok(())
+            })();
+            match restored {
+                Ok(()) => {
+                    if restored_rmeta {
+                        state.rmeta_produced();
+                    }
+                    Ok(())
+                }
+                Err(error) => {
+                    warn!(error = ?error, "cargo-cas entry disappeared during restore; compiling normally");
+                    normal_work.call(state)
+                }
             }
-            Err(error) => {
-                warn!(error = ?error, "cargo-cas entry disappeared during restore; compiling normally");
+        })
+    }
+
+    /// Holds only this action's lock while a miss is active, then checks the
+    /// entry again. A concurrent writer therefore turns a waiter into a local
+    /// restore instead of a duplicate rustc invocation.
+    pub(crate) fn coordinate(self, normal_work: Work, allow_hit: bool) -> Work {
+        Work::new(move |state| match self.lock() {
+            Ok(_lock) => {
+                if allow_hit {
+                    if let Some(entry) = self.lookup() {
+                        return self.restore_or_compile(entry, normal_work).call(state);
+                    }
+                }
                 normal_work.call(state)
             }
+            Err(error) => {
+                warn!(error = ?error, key = self.key.as_str(), "cargo-cas key lock unavailable; compiling normally");
+                normal_work.call(state)
+            }
+        })
+    }
+
+    fn lock(&self) -> io::Result<File> {
+        let lock_path = self
+            .cache
+            .join(LOCKS_DIRECTORY)
+            .join(format!("{}.lock", self.key.as_str()));
+        if let Some(parent) = lock_path.parent() {
+            fs::create_dir_all(parent)?;
         }
-    }))
+        if fs::symlink_metadata(&lock_path).is_ok_and(|metadata| !metadata.file_type().is_file()) {
+            return Err(io::Error::other("cargo-cas key lock is not a regular file"));
+        }
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = options.open(lock_path)?;
+        crate::util::flock::lock_exclusive(&file)?;
+        Ok(file)
+    }
 }
 
 /// Captures the immutable state required to publish a successful ordinary
