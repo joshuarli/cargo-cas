@@ -1714,6 +1714,11 @@ The log records `cargo-cas hit`, `cargo-cas miss`, `cargo-cas reject`, and
 or cache-infrastructure failure is only a performance cost: Cargo falls back
 to its ordinary compiler work.
 
+When a verified hit has compiler diagnostics cached by Cargo, `cargo-cas`
+restores and replays them through Cargo's ordinary fresh-unit path. This keeps
+dependency warnings and future-incompatibility reporting visible without
+rerunning that dependency's `rustc` invocation.
+
 Each completed cache-enabled build also records one `cargo-cas summary` event.
 Its structured fields report eligible units, hits, misses, rejects, eligible
 `rustc` work, same-key duplicate-build avoidance, and skip counts grouped by

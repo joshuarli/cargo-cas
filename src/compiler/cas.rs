@@ -22,7 +22,10 @@ use super::job_queue::Work;
 use super::{BuildRunner, CompileMode, CrateType, FileFlavor, Lto, Unit};
 use crate::util::CargoResult;
 
-const CACHE_FORMAT_VERSION: u8 = 1;
+// Version 2 adds the optional diagnostic output-cache artifact. Entries from
+// the prior format cannot provide Cargo's normal replay behavior, so they
+// must be rebuilt rather than accepted as a partial hit.
+const CACHE_FORMAT_VERSION: u8 = 2;
 const CACHE_DIRECTORY: &str = "cargo-cas-v1";
 const MANIFEST_FILE: &str = "manifest.json";
 const ARTIFACTS_DIRECTORY: &str = "artifacts";
@@ -285,6 +288,7 @@ enum ArtifactRole {
     Rmeta,
     Linkable,
     DepInfo,
+    OutputCache,
 }
 
 #[derive(Clone)]
@@ -292,6 +296,10 @@ struct ArtifactPath {
     role: ArtifactRole,
     source: PathBuf,
     destination: PathBuf,
+    /// Compiler diagnostics are optional because Cargo creates an output cache
+    /// lazily, only when rustc actually emits a cacheable message. All other
+    /// entry members are required for a valid reusable action.
+    required: bool,
 }
 
 /// Finds a complete, valid cache entry for an eligible dirty unit.
@@ -413,15 +421,24 @@ impl CacheAction {
     /// A hit can still disappear or become unreadable between lookup and the
     /// actual job. That is cache-infrastructure damage, so recover by running
     /// the already-prepared normal compiler work instead of failing Cargo.
-    pub(crate) fn restore_or_compile(&self, entry: CacheEntry, normal_work: Work) -> Work {
+    pub(crate) fn restore_or_compile(
+        &self,
+        entry: CacheEntry,
+        normal_work: Work,
+        replay_output: Work,
+    ) -> Work {
         debug_assert!(manifest_matches_expected(&entry.manifest, &self.artifacts));
 
         let restores = entry
             .manifest
             .artifacts
             .iter()
-            .zip(&self.artifacts)
-            .map(|(cached, expected)| {
+            .map(|cached| {
+                let expected = self
+                    .artifacts
+                    .iter()
+                    .find(|expected| artifact_matches_expected(cached, expected))
+                    .expect("validated cargo-cas manifest matches expected artifacts");
                 (
                     entry.root.join(ARTIFACTS_DIRECTORY).join(&cached.file),
                     expected.destination.clone(),
@@ -452,7 +469,17 @@ impl CacheAction {
                 Ok(())
             })();
             match restored {
-                Ok(()) => Ok(()),
+                Ok(()) => match replay_output.call(state) {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        // The output cache is only diagnostic replay state. A
+                        // bad or unreadable copy must never make an otherwise
+                        // reusable artifact set fail a valid Cargo build.
+                        warn!(error = ?error, "failed to replay cargo-cas diagnostics; compiling normally");
+                        stats.eligible_rustc();
+                        normal_work.call(state)
+                    }
+                },
                 Err(error) => {
                     warn!(error = ?error, "cargo-cas entry disappeared during restore; compiling normally");
                     stats.eligible_rustc();
@@ -465,13 +492,20 @@ impl CacheAction {
     /// Holds only this action's lock while a miss is active, then checks the
     /// entry again. A concurrent writer therefore turns a waiter into a local
     /// restore instead of a duplicate rustc invocation.
-    pub(crate) fn coordinate(self, normal_work: Work, allow_hit: bool) -> Work {
+    pub(crate) fn coordinate(
+        self,
+        normal_work: Work,
+        replay_output: Work,
+        allow_hit: bool,
+    ) -> Work {
         Work::new(move |state| match self.lock() {
             Ok(_lock) => {
                 if allow_hit {
                     if let Some(entry) = self.lookup() {
                         self.stats.duplicate_build_avoidance();
-                        return self.restore_or_compile(entry, normal_work).call(state);
+                        return self
+                            .restore_or_compile(entry, normal_work, replay_output)
+                            .call(state);
                     }
                 }
                 self.stats.eligible_rustc();
@@ -572,7 +606,7 @@ impl CachePublication {
         if self
             .artifacts
             .iter()
-            .any(|artifact| !artifact.source.is_file())
+            .any(|artifact| artifact.required && !artifact.source.is_file())
         {
             return Ok(());
         }
@@ -602,6 +636,9 @@ impl CachePublication {
 
         let mut manifest_artifacts = Vec::with_capacity(self.artifacts.len());
         for (index, artifact) in self.artifacts.iter().enumerate() {
+            if !artifact.required && !artifact.source.is_file() {
+                continue;
+            }
             let cache_name = index.to_string();
             let staged = temporary_artifacts.join(&cache_name);
             fs::copy(&artifact.source, &staged)?;
@@ -1022,6 +1059,7 @@ fn artifact_paths(
                 role,
                 source: output.path.clone(),
                 destination: output.path.clone(),
+                required: true,
             })
         })
         .collect::<Vec<_>>();
@@ -1030,6 +1068,14 @@ fn artifact_paths(
         role: ArtifactRole::DepInfo,
         source: dep_info.clone(),
         destination: dep_info,
+        required: true,
+    });
+    let output_cache = build_runner.files().message_cache_path(unit);
+    artifacts.push(ArtifactPath {
+        role: ArtifactRole::OutputCache,
+        source: output_cache.clone(),
+        destination: output_cache,
+        required: false,
     });
     // The scheduler may unblock a metadata-only dependent as soon as its
     // `.rmeta` has been restored. Keep that role first; Cargo bookkeeping can
@@ -1038,6 +1084,7 @@ fn artifact_paths(
         ArtifactRole::Rmeta => 0,
         ArtifactRole::Linkable => 1,
         ArtifactRole::DepInfo => 2,
+        ArtifactRole::OutputCache => 3,
     });
     Ok(artifacts)
 }
@@ -1333,15 +1380,31 @@ fn open_regular_file(path: &Path) -> io::Result<File> {
 }
 
 fn manifest_matches_expected(manifest: &CacheManifestV1, expected: &[ArtifactPath]) -> bool {
-    manifest.artifacts.len() == expected.len()
-        && manifest
-            .artifacts
+    manifest
+        .artifacts
+        .iter()
+        .enumerate()
+        .all(|(index, cached)| {
+            expected
+                .iter()
+                .any(|expected| artifact_matches_expected(cached, expected))
+                && manifest.artifacts[..index]
+                    .iter()
+                    .all(|previous| previous.role != cached.role)
+        })
+        && expected
             .iter()
-            .zip(expected)
-            .all(|(cached, expected)| {
-                cached.role == expected.role
-                    && cached.output_file_name == file_name(&expected.destination)
+            .filter(|expected| expected.required)
+            .all(|expected| {
+                manifest
+                    .artifacts
+                    .iter()
+                    .any(|cached| artifact_matches_expected(cached, expected))
             })
+}
+
+fn artifact_matches_expected(cached: &CachedArtifact, expected: &ArtifactPath) -> bool {
+    cached.role == expected.role && cached.output_file_name == file_name(&expected.destination)
 }
 
 fn digest_file(path: &Path) -> io::Result<String> {

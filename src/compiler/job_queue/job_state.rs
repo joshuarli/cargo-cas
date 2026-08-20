@@ -150,9 +150,15 @@ impl<'a, 'gctx> JobState<'a, 'gctx> {
     /// This should only be called once because a metadata file can only be
     /// produced once!
     pub fn rmeta_produced(&self) {
-        self.rmeta_required.set(false);
-        self.messages
-            .push(Message::Finish(self.id, Artifact::Metadata, Ok(())));
+        // A cache-hit restore may make metadata available before it discovers
+        // that a later cache artifact is unreadable and falls back to rustc.
+        // Rustc then emits its ordinary metadata notification. Keep the queue
+        // edge one-shot so that recovery cannot remove the same dependency
+        // edge twice.
+        if self.rmeta_required.replace(false) {
+            self.messages
+                .push(Message::Finish(self.id, Artifact::Metadata, Ok(())));
+        }
     }
 
     pub fn lock_exclusive(&self, lock: &LockKey) -> CargoResult<()> {

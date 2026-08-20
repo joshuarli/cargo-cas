@@ -412,7 +412,7 @@ pub fn answer() -> u32 { 41 }
     let manifest = cache_manifest();
     let manifest_json: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&manifest).unwrap()).unwrap();
-    assert_eq!(manifest_json["format_version"], 1);
+    assert_eq!(manifest_json["format_version"], 2);
     assert_eq!(manifest_json["identity"]["target_name"], REGISTRY_CRATE);
     assert_eq!(manifest_json["identity"]["compile_mode"], "check");
     assert!(manifest_json["identity"]["package_id"].is_string());
@@ -420,6 +420,27 @@ pub fn answer() -> u32 { 41 }
     assert!(manifest_json["identity"]["toolchain"]["rustc_verbose_version"].is_string());
     assert!(manifest_json["identity"]["toolchain"]["sysroot"].is_string());
     assert!(manifest_json["identity"]["dependency_action_keys"].is_array());
+
+    // A cache-format change is an explicit safe miss boundary. The same
+    // ActionKey is allowed to be republished only after ordinary rustc work
+    // has rebuilt the older entry in the current format.
+    let mut old_format = manifest_json.clone();
+    old_format["format_version"] = serde_json::Value::from(1);
+    fs::write(&manifest, serde_json::to_vec(&old_format).unwrap()).unwrap();
+    let old_format_project = registry_project("cas-old-format", "\"1.0.0\"");
+    let old_format_output = run_check(
+        &old_format_project,
+        &paths::root().join("cas-old-format-target"),
+        "",
+    );
+    assert!(
+        crate_was_compiled(&old_format_output, REGISTRY_CRATE),
+        "an older cache format must be rebuilt instead of restored:\n{}",
+        String::from_utf8_lossy(&old_format_output.stderr)
+    );
+    let rebuilt_manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&manifest).unwrap()).unwrap();
+    assert_eq!(rebuilt_manifest["format_version"], 2);
 
     let exact_output = run_check(&exact, &paths::root().join("cas-exact-target"), "");
     assert!(
@@ -855,6 +876,83 @@ edition = "2024"
         String::from_utf8_lossy(&skip_output.stderr).contains("skips={\"path source\":"),
         "the summary should aggregate skip reasons:\n{}",
         String::from_utf8_lossy(&skip_output.stderr)
+    );
+}
+
+#[cargo_test]
+fn cache_hit_replays_cached_dependency_diagnostics() {
+    const PACKAGE: &str = "cas-diagnostic-replay-dep";
+    const CRATE: &str = "cas_diagnostic_replay_dep";
+
+    registry::init();
+    Package::new(PACKAGE, "1.0.0")
+        .edition("2024")
+        .file(
+            "src/lib.rs",
+            "#![warn(dead_code)]\nfn deliberately_unused() {}\npub fn answer() {}\n",
+        )
+        .publish();
+    let manifest = format!(
+        r#"[package]
+name = "cas-diagnostic-replay-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+{PACKAGE} = "1.0.0"
+"#,
+    );
+    let first = project_in("cas-diagnostic-replay-first")
+        .file("Cargo.toml", &manifest)
+        .file(
+            "src/main.rs",
+            "fn main() { cas_diagnostic_replay_dep::answer(); }\n",
+        )
+        .build();
+    let second = project_in("cas-diagnostic-replay-second")
+        .file("Cargo.toml", &manifest)
+        .file(
+            "src/main.rs",
+            "fn main() { cas_diagnostic_replay_dep::answer(); }\n",
+        )
+        .build();
+
+    let first_output = run_check(
+        &first,
+        &paths::root().join("cas-diagnostic-replay-first-target"),
+        "",
+    );
+    assert!(crate_was_compiled(&first_output, CRATE));
+    assert!(
+        String::from_utf8_lossy(&first_output.stderr).contains("deliberately_unused"),
+        "the cold compiler invocation must emit the dependency warning:\n{}",
+        String::from_utf8_lossy(&first_output.stderr)
+    );
+    let manifest_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(cache_manifest()).unwrap()).unwrap();
+    assert!(
+        manifest_json["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|artifact| artifact["role"] == "output-cache"),
+        "a diagnostic-producing action must publish its output cache"
+    );
+
+    let second_output = run_check(
+        &second,
+        &paths::root().join("cas-diagnostic-replay-second-target"),
+        "",
+    );
+    assert!(
+        !crate_was_compiled(&second_output, CRATE),
+        "a diagnostic cache hit must not re-run dependency rustc:\n{}",
+        String::from_utf8_lossy(&second_output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&second_output.stderr).contains("deliberately_unused"),
+        "a diagnostic cache hit must replay the dependency warning:\n{}",
+        String::from_utf8_lossy(&second_output.stderr)
     );
 }
 

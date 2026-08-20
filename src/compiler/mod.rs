@@ -220,14 +220,15 @@ fn compile<'gctx>(
                 let cache_action = cas::prepare(build_runner, unit)?;
                 let work = if let Some(action) = cache_action {
                     let normal_work = rustc(build_runner, unit, exec)?;
+                    let replay_output = cache_hit_output_replay(build_runner, unit);
                     if !force {
                         if let Some(entry) = action.lookup() {
-                            action.restore_or_compile(entry, normal_work)
+                            action.restore_or_compile(entry, normal_work, replay_output)
                         } else {
-                            action.coordinate(normal_work, true)
+                            action.coordinate(normal_work, replay_output, true)
                         }
                     } else {
-                        action.coordinate(normal_work, false)
+                        action.coordinate(normal_work, replay_output, false)
                     }
                 } else if unit.mode.is_doc() || unit.mode.is_doc_scrape() {
                     rustdoc(build_runner, unit)?
@@ -278,6 +279,20 @@ fn compile<'gctx>(
     }
 
     Ok(())
+}
+
+/// A global cache hit is still a normal dirty Cargo job for the destination
+/// workspace. Replaying the restored unit's local message cache preserves the
+/// same warning and future-incompatibility behavior that Cargo uses for an
+/// ordinary fresh unit, without re-running rustc.
+fn cache_hit_output_replay(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> Work {
+    replay_output_cache(
+        unit.pkg.package_id(),
+        ManifestErrorContext::new(build_runner, unit),
+        &unit.target,
+        build_runner.files().message_cache_path(unit),
+        OutputOptions::for_fresh(build_runner, unit),
+    )
 }
 
 /// Generates the warning message used when fallible doc-scrape units fail,
