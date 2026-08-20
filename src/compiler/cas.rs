@@ -17,7 +17,7 @@ use tracing::{debug, warn};
 
 use super::fingerprint;
 use super::job_queue::Work;
-use super::{BuildRunner, CompileMode, FileFlavor, Lto, Unit};
+use super::{BuildRunner, CompileMode, CrateType, FileFlavor, Lto, Unit};
 use crate::util::CargoResult;
 
 const CACHE_FORMAT_VERSION: u8 = 0;
@@ -130,6 +130,7 @@ struct CachedArtifact {
 #[serde(rename_all = "kebab-case")]
 enum ArtifactRole {
     Rmeta,
+    Linkable,
     DepInfo,
 }
 
@@ -243,8 +244,8 @@ pub(crate) fn publication(
 }
 
 impl CachePublication {
-    /// Stages and atomically publishes the rmeta plus local dep-info produced
-    /// by a successful ordinary Cargo compilation.
+    /// Stages and atomically publishes dependency artifacts plus local dep-info
+    /// produced by a successful ordinary Cargo compilation.
     ///
     /// Publication is intentionally best-effort.  A cache miss is only a
     /// performance cost, so I/O errors here must not turn a successful compile
@@ -406,7 +407,11 @@ fn action_key_inner(
                 .collect(),
             compile_kind: "host",
         },
-        mode: "check",
+        mode: match unit.mode {
+            CompileMode::Check { test: false } => "check",
+            CompileMode::Build => "build",
+            _ => return None,
+        },
         profile: &unit.profile,
         lto: lto_input(build_runner.lto[unit]),
         rustc_verbose_version: &build_runner.bcx.rustc().verbose_version,
@@ -435,10 +440,19 @@ fn eligible_without_dependencies(build_runner: &BuildRunner<'_, '_>, unit: &Unit
         && !unit.target.proc_macro()
         && unit.target.is_lib()
         && unit.target.is_linkable()
+        // A normal `lib`/`rlib` emits only Rust dependency artifacts.  Dynamic
+        // libraries introduce platform-linker and debug-bundle inputs, which
+        // are intentionally outside the Gate 3 cache contract.
+        && unit
+            .target
+            .rustc_crate_types()
+            .iter()
+            .all(|crate_type| matches!(crate_type, CrateType::Lib | CrateType::Rlib))
         && !unit.target.is_example()
         && !unit.artifact.is_true()
-        && matches!(unit.mode, CompileMode::Check { test: false })
+        && matches!(unit.mode, CompileMode::Check { test: false } | CompileMode::Build)
         && !unit.profile.incremental
+        && unit.profile.trim_paths.is_none()
         // A custom target specification can contain arbitrary local paths and
         // target-specific configuration.  V0 intentionally shares only the
         // native host unit on macOS.
@@ -465,11 +479,17 @@ fn artifact_paths(
     let mut artifacts = build_runner
         .outputs(unit)?
         .iter()
-        .filter(|output| output.flavor == FileFlavor::Rmeta)
-        .map(|output| ArtifactPath {
-            role: ArtifactRole::Rmeta,
-            source: output.path.clone(),
-            destination: output.path.clone(),
+        .filter_map(|output| {
+            let role = match output.flavor {
+                FileFlavor::Rmeta => ArtifactRole::Rmeta,
+                FileFlavor::Linkable if unit.mode == CompileMode::Build => ArtifactRole::Linkable,
+                _ => return None,
+            };
+            Some(ArtifactPath {
+                role,
+                source: output.path.clone(),
+                destination: output.path.clone(),
+            })
         })
         .collect::<Vec<_>>();
     let dep_info = build_runner.files().fingerprint_file_path(unit, "dep-");

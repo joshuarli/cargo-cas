@@ -25,6 +25,21 @@ fn run_check(project: &Project, target_dir: &Path, extra: &str) -> RawOutput {
     cargo.run()
 }
 
+fn run_build(project: &Project, target_dir: &Path) -> RawOutput {
+    let mut cargo = project.cargo("build -Zcargo-cas -vv");
+    cargo
+        .arg("--target-dir")
+        .arg(target_dir)
+        .masquerade_as_nightly_cargo(&["cargo-cas"]);
+    cargo.run()
+}
+
+fn run_normal_build(project: &Project, target_dir: &Path) -> RawOutput {
+    let mut cargo = project.cargo("build -vv");
+    cargo.arg("--target-dir").arg(target_dir);
+    cargo.run()
+}
+
 fn registry_project(name: &str, dependency: &str) -> Project {
     let manifest = format!(
         r#"[package]
@@ -174,5 +189,90 @@ edition = "2024"
         crate_was_compiled(&output, "local_dependency"),
         "path sources are ineligible and must run normal rustc:\n{}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cargo_test]
+fn registry_build_cache_restores_metadata_and_linkable_artifacts() {
+    const BUILD_PACKAGE: &str = "cas-gate-three-dep";
+    const BUILD_CRATE: &str = "cas_gate_three_dep";
+
+    registry::init();
+    Package::new(BUILD_PACKAGE, "1.0.0")
+        .edition("2024")
+        .file("src/lib.rs", "pub fn answer() -> u32 { 42 }\n")
+        .publish();
+
+    let first_manifest = format!(
+        r#"[package]
+name = "cas-build-first"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+{BUILD_PACKAGE} = "1.0.0"
+"#,
+    );
+    let first = project_in("cas-build-first")
+        .file("Cargo.toml", &first_manifest)
+        .file(
+            "src/main.rs",
+            "fn main() { println!(\"{}\", cas_gate_three_dep::answer()); }\n",
+        )
+        .build();
+    let second_manifest = format!(
+        r#"[package]
+name = "cas-build-second"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+{BUILD_PACKAGE} = "1.0.0"
+"#,
+    );
+    let second = project_in("cas-build-second")
+        .file("Cargo.toml", &second_manifest)
+        .file(
+            "src/main.rs",
+            "fn main() { println!(\"{}\", cas_gate_three_dep::answer() + 1); }\n",
+        )
+        .build();
+
+    let first_target = paths::root().join("cas-build-first-target");
+    let first_output = run_build(&first, &first_target);
+    assert!(crate_was_compiled(&first_output, BUILD_CRATE));
+    let manifest = cache_manifest();
+    let manifest_text = fs::read_to_string(&manifest).unwrap();
+    assert!(manifest_text.contains("\"rmeta\""));
+    assert!(manifest_text.contains("\"linkable\""));
+    assert!(manifest_text.contains(".rlib"));
+
+    let second_target = paths::root().join("cas-build-second-target");
+    let second_output = run_build(&second, &second_target);
+    assert!(
+        !crate_was_compiled(&second_output, BUILD_CRATE),
+        "matching build action should restore .rmeta and .rlib:\n{}",
+        String::from_utf8_lossy(&second_output.stderr)
+    );
+    assert!(crate_was_compiled(&second_output, "cas_build_second"));
+    assert!(
+        second_target.join("debug/cas-build-second").is_file(),
+        "a cache hit must leave Cargo's ordinary final binary intact"
+    );
+
+    // The materialized artifacts and normal fingerprint state are also usable
+    // by an invocation that does not opt into cargo-cas.  This guards the
+    // scheduler boundary: a cache hit is normal local Cargo state, not a
+    // separate freshness regime.
+    let normal_output = run_normal_build(&second, &second_target);
+    assert!(
+        !crate_was_compiled(&normal_output, BUILD_CRATE),
+        "normal Cargo should accept the materialized dependency artifact:\n{}",
+        String::from_utf8_lossy(&normal_output.stderr)
+    );
+    assert!(
+        !crate_was_compiled(&normal_output, "cas_build_second"),
+        "the normal final artifact should remain fresh after a cache hit:\n{}",
+        String::from_utf8_lossy(&normal_output.stderr)
     );
 }
