@@ -840,3 +840,141 @@ edition = "2024"
         elapsed.as_millis(),
     );
 }
+
+#[cargo_test]
+fn resolved_git_revisions_are_reused_without_treating_branches_as_identity() {
+    const PACKAGE: &str = "cas-gate-seven-dep";
+    const CRATE: &str = "cas_gate_seven_dep";
+
+    let (git_project, repository) = cargo_test_support::git::new_repo(PACKAGE, |project| {
+        project
+            .file(
+                "Cargo.toml",
+                r#"[package]
+name = "cas-gate-seven-dep"
+version = "1.0.0"
+edition = "2024"
+"#,
+            )
+            .file("src/lib.rs", "pub fn answer() -> u32 { 1 }\n")
+    });
+    let first_revision = repository.head().unwrap().target().unwrap().to_string();
+    let url = git_project.url();
+
+    let branch_manifest = format!(
+        r#"[package]
+name = "cas-gate-seven-branch-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+{PACKAGE} = {{ git = "{url}", branch = "master" }}
+"#,
+    );
+    let first = project_in("cas-gate-seven-first")
+        .file("Cargo.toml", &branch_manifest)
+        .file(
+            "src/main.rs",
+            "fn main() { println!(\"{}\", cas_gate_seven_dep::answer()); }\n",
+        )
+        .build();
+    let same_revision = project_in("cas-gate-seven-same-revision")
+        .file("Cargo.toml", &branch_manifest)
+        .file(
+            "src/main.rs",
+            "fn main() { println!(\"{}\", cas_gate_seven_dep::answer()); }\n",
+        )
+        .build();
+
+    let first_output = run_check(
+        &first,
+        &paths::root().join("cas-gate-seven-first-target"),
+        "",
+    );
+    assert!(crate_was_compiled(&first_output, CRATE));
+    let first_lockfile = first.read_lockfile();
+    let same_output = run_check(
+        &same_revision,
+        &paths::root().join("cas-gate-seven-same-revision-target"),
+        "",
+    );
+    assert!(
+        !crate_was_compiled(&same_output, CRATE),
+        "the same resolved git revision should reuse the cached action:\n{}",
+        String::from_utf8_lossy(&same_output.stderr)
+    );
+
+    // Move the branch after the first cache publication. A new workspace that
+    // resolves the branch must compile the new commit, proving that the branch
+    // label itself is not an ActionKey input.
+    git_project.change_file("src/lib.rs", "pub fn answer() -> u32 { 2 }\n");
+    cargo_test_support::git::add(&repository);
+    let second_revision = cargo_test_support::git::commit(&repository).to_string();
+    assert_ne!(first_revision, second_revision);
+    let moved_branch = project_in("cas-gate-seven-moved-branch")
+        .file("Cargo.toml", &branch_manifest)
+        .file(
+            "src/main.rs",
+            "fn main() { println!(\"{}\", cas_gate_seven_dep::answer()); }\n",
+        )
+        .build();
+    let moved_output = run_check(
+        &moved_branch,
+        &paths::root().join("cas-gate-seven-moved-branch-target"),
+        "",
+    );
+    assert!(
+        crate_was_compiled(&moved_output, CRATE),
+        "a moved git branch must miss because its resolved revision changed:\n{}",
+        String::from_utf8_lossy(&moved_output.stderr)
+    );
+
+    // An explicit revision is also immutable, but Cargo's compiler metadata
+    // distinguishes that declaration from a branch dependency. It receives a
+    // separate ActionKey instead of overwriting the branch entry.
+    let explicit_manifest = format!(
+        r#"[package]
+name = "cas-gate-seven-explicit-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+{PACKAGE} = {{ git = "{url}", rev = "{first_revision}" }}
+"#,
+    );
+    let explicit = project_in("cas-gate-seven-explicit")
+        .file("Cargo.toml", &explicit_manifest)
+        .file(
+            "src/main.rs",
+            "fn main() { println!(\"{}\", cas_gate_seven_dep::answer()); }\n",
+        )
+        .build();
+    let explicit_output = run_check(
+        &explicit,
+        &paths::root().join("cas-gate-seven-explicit-target"),
+        "",
+    );
+    assert!(crate_was_compiled(&explicit_output, CRATE));
+
+    // Reuse the old branch resolution from a lockfile. The branch label is
+    // still present in the package source, but its immutable locked revision
+    // is restored exactly, so this action must recover the original hit.
+    let pinned = project_in("cas-gate-seven-locked-old-revision")
+        .file("Cargo.toml", &branch_manifest)
+        .file("Cargo.lock", &first_lockfile)
+        .file(
+            "src/main.rs",
+            "fn main() { println!(\"{}\", cas_gate_seven_dep::answer()); }\n",
+        )
+        .build();
+    let pinned_output = run_check(
+        &pinned,
+        &paths::root().join("cas-gate-seven-locked-old-revision-target"),
+        "",
+    );
+    assert!(
+        !crate_was_compiled(&pinned_output, CRATE),
+        "a lockfile-pinned old revision should recover its prior cached action:\n{}",
+        String::from_utf8_lossy(&pinned_output.stderr)
+    );
+}
