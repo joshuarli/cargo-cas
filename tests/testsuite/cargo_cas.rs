@@ -699,6 +699,147 @@ edition = "2024"
 }
 
 #[cargo_test]
+fn registry_source_and_transitive_action_identity_never_share_entries() {
+    const SOURCE_PACKAGE: &str = "cas-key-source";
+    const SOURCE_CRATE: &str = "cas_key_source";
+    const CHILD_PACKAGE: &str = "cas-key-child";
+    const PARENT_PACKAGE: &str = "cas-key-parent";
+    const PARENT_CRATE: &str = "cas_key_parent";
+
+    registry::alt_init();
+    // The two registry archives deliberately have the same package name and
+    // version but different content. A package name/version is never enough
+    // to address a global artifact; source URL and registry checksum are part
+    // of the ActionKey.
+    Package::new(SOURCE_PACKAGE, "1.0.0")
+        .edition("2024")
+        .file("src/lib.rs", "pub const VALUE: usize = 1;\n")
+        .publish();
+    Package::new(SOURCE_PACKAGE, "1.0.0")
+        .edition("2024")
+        .file("src/lib.rs", "pub const VALUE: usize = 2;\n")
+        .alternative(true)
+        .publish();
+
+    let first_source = project_in("cas-key-main-registry")
+        .file(
+            "Cargo.toml",
+            &format!(
+                r#"[package]
+name = "main-registry-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+{SOURCE_PACKAGE} = "1.0.0"
+"#,
+            ),
+        )
+        .file(
+            "src/main.rs",
+            "const _: [(); 1] = [(); cas_key_source::VALUE];\nfn main() {}\n",
+        )
+        .build();
+    let alternate_source = project_in("cas-key-alternative-registry")
+        .file(
+            "Cargo.toml",
+            &format!(
+                r#"[package]
+name = "alternative-registry-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+{SOURCE_PACKAGE} = {{ version = "1.0.0", registry = "alternative" }}
+"#,
+            ),
+        )
+        .file(
+            "src/main.rs",
+            "const _: [(); 2] = [(); cas_key_source::VALUE];\nfn main() {}\n",
+        )
+        .build();
+
+    let first_source_output = run_check(
+        &first_source,
+        &paths::root().join("cas-key-main-registry-target"),
+        "",
+    );
+    assert!(crate_was_compiled(&first_source_output, SOURCE_CRATE));
+    let alternate_source_output = run_check(
+        &alternate_source,
+        &paths::root().join("cas-key-alternative-registry-target"),
+        "",
+    );
+    assert!(
+        crate_was_compiled(&alternate_source_output, SOURCE_CRATE),
+        "a same-name/version package from another registry must not reuse the first source:\n{}",
+        String::from_utf8_lossy(&alternate_source_output.stderr)
+    );
+
+    Package::new(CHILD_PACKAGE, "1.0.0")
+        .edition("2024")
+        .file("src/lib.rs", "pub const VALUE: usize = 1;\n")
+        .publish();
+    Package::new(PARENT_PACKAGE, "1.0.0")
+        .edition("2024")
+        .dep(CHILD_PACKAGE, "1")
+        .file(
+            "src/lib.rs",
+            "pub const VALUE: usize = cas_key_child::VALUE;\n",
+        )
+        .publish();
+    let parent_manifest = format!(
+        r#"[package]
+name = "transitive-action-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+{PARENT_PACKAGE} = "1.0.0"
+"#,
+    );
+    let old_child = project_in("cas-key-transitive-old")
+        .file("Cargo.toml", &parent_manifest)
+        .file(
+            "src/main.rs",
+            "const _: [(); 1] = [(); cas_key_parent::VALUE];\nfn main() {}\n",
+        )
+        .build();
+    let old_child_output = run_check(
+        &old_child,
+        &paths::root().join("cas-key-transitive-old-target"),
+        "",
+    );
+    assert!(crate_was_compiled(&old_child_output, PARENT_CRATE));
+
+    // The parent source is unchanged, but a fresh resolution selects a new
+    // child action. The parent's ActionKey must include that dependency DAG
+    // edge rather than reuse metadata compiled against child 1.0.0.
+    Package::new(CHILD_PACKAGE, "1.1.0")
+        .edition("2024")
+        .file("src/lib.rs", "pub const VALUE: usize = 2;\n")
+        .publish();
+    let new_child = project_in("cas-key-transitive-new")
+        .file("Cargo.toml", &parent_manifest)
+        .file(
+            "src/main.rs",
+            "const _: [(); 2] = [(); cas_key_parent::VALUE];\nfn main() {}\n",
+        )
+        .build();
+    let new_child_output = run_check(
+        &new_child,
+        &paths::root().join("cas-key-transitive-new-target"),
+        "",
+    );
+    assert!(
+        crate_was_compiled(&new_child_output, PARENT_CRATE),
+        "a changed direct dependency action must invalidate its parent:\n{}",
+        String::from_utf8_lossy(&new_child_output.stderr)
+    );
+}
+
+#[cargo_test]
 fn registry_build_cache_restores_metadata_and_linkable_artifacts() {
     const BUILD_PACKAGE: &str = "cas-gate-three-dep";
     const BUILD_CRATE: &str = "cas_gate_three_dep";
