@@ -1669,6 +1669,13 @@ Deletion of cache contents can be performed by passing one of the cache options:
 - `--max-crate-size=SIZE` --- Deletes the oldest crate cache files until the cache is under the given size.
 - `--max-git-size=SIZE` --- Deletes the oldest git dependency caches until the cache is under the given size.
 - `--max-download-size=SIZE` --- Deletes the oldest downloaded cache data until the cache is under the given size.
+- `--max-cas-age=DURATION` --- Deletes immutable experimental `cargo-cas` artifact entries that have not been used since the given age.
+- `--max-cas-size=SIZE` --- Deletes the oldest immutable experimental `cargo-cas` artifact entries until the cache is under the given size.
+
+The `cargo-cas` entries use their own last-use records and are not part of the
+automatic global-cache policy. They are only removed when one of the explicit
+`--max-cas-*` options is supplied. Removing an entry only turns its next use
+into a normal compilation; it does not affect build correctness.
 
 A DURATION is specified in the form "N seconds/minutes/days/weeks/months" where N is an integer.
 

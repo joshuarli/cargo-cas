@@ -32,7 +32,7 @@ pub mod artifact;
 mod build_config;
 pub(crate) mod build_context;
 pub(crate) mod build_runner;
-mod cas;
+pub(crate) mod cas;
 mod compilation;
 mod compile_kind;
 mod crate_type;

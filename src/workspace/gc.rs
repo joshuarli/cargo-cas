@@ -131,9 +131,20 @@ pub struct GcOpts {
     pub max_git_size: Option<u64>,
     /// The `--max-download-size` CLI option.
     pub max_download_size: Option<u64>,
+    /// The `--max-cas-age` CLI option.
+    pub max_cas_age: Option<Duration>,
+    /// The `--max-cas-size` CLI option.
+    pub max_cas_size: Option<u64>,
 }
 
 impl GcOpts {
+    /// Returns whether any global-cache or cargo-cas cleaning options are set.
+    pub fn is_gc_opt_set(&self) -> bool {
+        self.is_download_cache_opt_set()
+            || self.max_cas_age.is_some()
+            || self.max_cas_size.is_some()
+    }
+
     /// Returns whether any download cache cleaning options are set.
     pub fn is_download_cache_opt_set(&self) -> bool {
         self.max_src_age.is_some()
@@ -305,7 +316,7 @@ impl<'a, 'gctx> Gc<'a, 'gctx> {
     /// Performs garbage collection based on the given options.
     pub fn gc(&mut self, clean_ctx: &mut CleanContext<'gctx>, gc_opts: &GcOpts) -> CargoResult<()> {
         self.global_cache_tracker.clean(clean_ctx, gc_opts)?;
-        // In the future, other gc operations go here, such as target cleaning.
+        crate::compiler::cas::gc(clean_ctx, gc_opts.max_cas_age, gc_opts.max_cas_size)?;
         Ok(())
     }
 }

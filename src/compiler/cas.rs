@@ -10,6 +10,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime};
 
 use cargo_util::paths;
 use serde::{Deserialize, Serialize};
@@ -25,6 +26,7 @@ const CACHE_DIRECTORY: &str = "cargo-cas-v0";
 const MANIFEST_FILE: &str = "manifest.json";
 const ARTIFACTS_DIRECTORY: &str = "artifacts";
 const LOCKS_DIRECTORY: &str = "locks";
+const ACCESS_DIRECTORY: &str = "access";
 
 static TEMPORARY_ENTRY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -220,6 +222,7 @@ impl CacheAction {
             return None;
         }
 
+        mark_used(&self.cache, self.key.as_str());
         Some(CacheEntry { root, manifest })
     }
 
@@ -386,6 +389,7 @@ impl CachePublication {
         let final_entry = self.cache.join(self.key.as_str());
         if fs::symlink_metadata(&final_entry).is_ok() {
             if entry_is_valid(&final_entry, &self.key, &self.artifacts) {
+                mark_used(&self.cache, self.key.as_str());
                 return Ok(());
             }
             // A process that died before publication cannot leave a final
@@ -446,6 +450,7 @@ impl CachePublication {
         if temporary_entry.exists() {
             let _ = fs::remove_dir_all(&temporary_entry);
         }
+        mark_used(&self.cache, self.key.as_str());
         Ok(())
     }
 }
@@ -649,13 +654,159 @@ fn artifact_paths(
 }
 
 fn cache_root(build_runner: &BuildRunner<'_, '_>) -> PathBuf {
-    build_runner
-        .bcx
-        .gctx
-        .home()
+    cache_root_for_gctx(build_runner.bcx.gctx)
+}
+
+fn cache_root_for_gctx(gctx: &crate::GlobalContext) -> PathBuf {
+    gctx.home()
         .join("cache")
         .join(CACHE_DIRECTORY)
         .into_path_unlocked()
+}
+
+/// Removes whole immutable entries based on their access age or aggregate
+/// size. Cargo's normal compilation path holds the package-cache shared lock;
+/// `cargo clean gc` holds its mutate-exclusive counterpart, so this sweep
+/// cannot race an active lookup, restore, publication, or per-key writer.
+pub(crate) fn gc(
+    clean_ctx: &mut crate::ops::CleanContext<'_>,
+    max_age: Option<Duration>,
+    max_size: Option<u64>,
+) -> CargoResult<()> {
+    if max_age.is_none() && max_size.is_none() {
+        return Ok(());
+    }
+
+    let root = cache_root_for_gctx(clean_ctx.gctx);
+    let mut entries = cache_entries(&root)?;
+    let now = SystemTime::now();
+    let mut remove = Vec::new();
+
+    if let Some(max_age) = max_age {
+        let cutoff = now.checked_sub(max_age).unwrap_or(SystemTime::UNIX_EPOCH);
+        entries.retain(|entry| {
+            if entry.last_used < cutoff {
+                remove.push(entry.path.clone());
+                if entry.access.is_file() {
+                    remove.push(entry.access.clone());
+                }
+                false
+            } else {
+                true
+            }
+        });
+        remove_abandoned_temporary_entries(&root, cutoff, &mut remove)?;
+    }
+
+    if let Some(max_size) = max_size {
+        entries.sort_unstable_by_key(|entry| entry.last_used);
+        let mut total_size = entries.iter().map(|entry| entry.size).sum::<u64>();
+        for entry in entries {
+            if total_size <= max_size {
+                break;
+            }
+            total_size = total_size.saturating_sub(entry.size);
+            remove.push(entry.path);
+            if entry.access.is_file() {
+                remove.push(entry.access);
+            }
+        }
+    }
+
+    remove.sort();
+    remove.dedup();
+    clean_ctx.remove_paths(&remove)?;
+    Ok(())
+}
+
+struct CacheGcEntry {
+    path: PathBuf,
+    access: PathBuf,
+    last_used: SystemTime,
+    size: u64,
+}
+
+fn cache_entries(root: &Path) -> CargoResult<Vec<CacheGcEntry>> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry.file_type().is_ok_and(|kind| kind.is_dir())
+                && is_action_key_name(&entry.file_name().to_string_lossy())
+        })
+        .map(|entry| {
+            let path = entry.path();
+            let access = root.join(ACCESS_DIRECTORY).join(entry.file_name());
+            let last_used = fs::metadata(&access)
+                .and_then(|metadata| metadata.modified())
+                .or_else(|_| fs::metadata(&path).and_then(|metadata| metadata.modified()))
+                // Unknown timestamps must be retained; the cache is only an
+                // optimization, but GC should prefer a harmless miss delay to
+                // deleting an entry it cannot age safely.
+                .unwrap_or(SystemTime::now());
+            Ok(CacheGcEntry {
+                size: directory_size(&path)?,
+                path,
+                access,
+                last_used,
+            })
+        })
+        .collect()
+}
+
+fn remove_abandoned_temporary_entries(
+    root: &Path,
+    cutoff: SystemTime,
+    remove: &mut Vec<PathBuf>,
+) -> CargoResult<()> {
+    let temporary_root = root.join("tmp");
+    let entries = match fs::read_dir(&temporary_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries.filter_map(Result::ok) {
+        if entry.file_type()?.is_dir()
+            && entry
+                .metadata()?
+                .modified()
+                .is_ok_and(|modified| modified < cutoff)
+        {
+            remove.push(entry.path());
+        }
+    }
+    Ok(())
+}
+
+fn directory_size(path: &Path) -> CargoResult<u64> {
+    walkdir::WalkDir::new(path)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .try_fold(0_u64, |size, entry| {
+            Ok(size.saturating_add(entry.metadata()?.len()))
+        })
+}
+
+fn is_action_key_name(name: &str) -> bool {
+    name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn mark_used(cache: &Path, key: &str) {
+    let access = cache.join(ACCESS_DIRECTORY).join(key);
+    let result = (|| -> io::Result<()> {
+        let parent = access.parent().expect("cargo-cas access path has parent");
+        fs::create_dir_all(parent)?;
+        let file = OpenOptions::new().create(true).append(true).open(access)?;
+        file.set_times(fs::FileTimes::new().set_modified(SystemTime::now()))
+    })();
+    if let Err(error) = result {
+        debug!(error = ?error, "failed to record cargo-cas last use");
+    }
 }
 
 fn validate_manifest(root: &Path, manifest: &CacheManifestV0) -> bool {

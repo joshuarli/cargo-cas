@@ -5,7 +5,7 @@ use std::os::unix::fs::symlink;
 use std::path::Path;
 use std::process::{Child, Output, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::prelude::*;
 use cargo_test_support::registry::{self, Package};
@@ -41,6 +41,12 @@ fn run_build(project: &Project, target_dir: &Path) -> RawOutput {
 fn run_normal_build(project: &Project, target_dir: &Path) -> RawOutput {
     let mut cargo = project.cargo("build -vv");
     cargo.arg("--target-dir").arg(target_dir);
+    cargo.run()
+}
+
+fn run_cas_gc(project: &Project, options: &str) -> RawOutput {
+    let mut cargo = project.cargo(&format!("clean gc -Zgc {options}"));
+    cargo.masquerade_as_nightly_cargo(&["gc"]);
     cargo.run()
 }
 
@@ -976,5 +982,114 @@ edition = "2024"
         !crate_was_compiled(&pinned_output, CRATE),
         "a lockfile-pinned old revision should recover its prior cached action:\n{}",
         String::from_utf8_lossy(&pinned_output.stderr)
+    );
+}
+
+#[cargo_test]
+fn cargo_cas_gc_evicts_by_size_and_last_use_age() {
+    const PACKAGE: &str = "cas-gate-eight-dep";
+    const CRATE: &str = "cas_gate_eight_dep";
+
+    registry::init();
+    Package::new(PACKAGE, "1.0.0")
+        .edition("2024")
+        .file("src/lib.rs", "pub fn answer() -> u32 { 42 }\n")
+        .publish();
+
+    let manifest = format!(
+        r#"[package]
+name = "cas-gate-eight-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+{PACKAGE} = "1.0.0"
+"#,
+    );
+    let first = project_in("cas-gate-eight-first")
+        .file("Cargo.toml", &manifest)
+        .file(
+            "src/main.rs",
+            "fn main() { println!(\"{}\", cas_gate_eight_dep::answer()); }\n",
+        )
+        .build();
+    let after_size_gc = project_in("cas-gate-eight-after-size-gc")
+        .file("Cargo.toml", &manifest)
+        .file(
+            "src/main.rs",
+            "fn main() { println!(\"{}\", cas_gate_eight_dep::answer()); }\n",
+        )
+        .build();
+    let after_age_gc = project_in("cas-gate-eight-after-age-gc")
+        .file("Cargo.toml", &manifest)
+        .file(
+            "src/main.rs",
+            "fn main() { println!(\"{}\", cas_gate_eight_dep::answer()); }\n",
+        )
+        .build();
+
+    let first_output = run_check(
+        &first,
+        &paths::root().join("cas-gate-eight-first-target"),
+        "",
+    );
+    assert!(crate_was_compiled(&first_output, CRATE));
+    let first_manifest = cache_manifest();
+    let cache_root = paths::cargo_home().join("cache/cargo-cas-v0");
+    let first_access = cache_root
+        .join("access")
+        .join(first_manifest.parent().unwrap().file_name().unwrap());
+    assert!(
+        first_access.is_file(),
+        "a published cache entry records its last use separately from immutable artifacts"
+    );
+
+    // An explicit size policy removes entire entries. The next use is an
+    // ordinary cache miss and must rebuild rather than observing partial
+    // state.
+    run_cas_gc(&first, "--max-cas-size=0");
+    assert!(
+        !first_manifest.exists(),
+        "the zero-size policy must evict the immutable entry"
+    );
+    assert!(!first_access.exists());
+    let after_size_output = run_check(
+        &after_size_gc,
+        &paths::root().join("cas-gate-eight-after-size-gc-target"),
+        "",
+    );
+    assert!(
+        crate_was_compiled(&after_size_output, CRATE),
+        "a size-evicted entry must rebuild normally:\n{}",
+        String::from_utf8_lossy(&after_size_output.stderr)
+    );
+
+    let regenerated_manifest = cache_manifest();
+    let regenerated_access = cache_root
+        .join("access")
+        .join(regenerated_manifest.parent().unwrap().file_name().unwrap());
+    let access_file = fs::OpenOptions::new()
+        .write(true)
+        .open(&regenerated_access)
+        .unwrap();
+    access_file
+        .set_times(fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))
+        .unwrap();
+
+    run_cas_gc(&after_size_gc, "--max-cas-age=1day");
+    assert!(
+        !regenerated_manifest.exists(),
+        "an old last-use timestamp must evict the immutable entry"
+    );
+    assert!(!regenerated_access.exists());
+    let after_age_output = run_check(
+        &after_age_gc,
+        &paths::root().join("cas-gate-eight-after-age-gc-target"),
+        "",
+    );
+    assert!(
+        crate_was_compiled(&after_age_output, CRATE),
+        "an age-evicted entry must rebuild normally:\n{}",
+        String::from_utf8_lossy(&after_age_output.stderr)
     );
 }

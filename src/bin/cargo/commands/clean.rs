@@ -130,6 +130,24 @@ pub fn cli() -> Command {
                     )
                     .value_name("SIZE")
                     .value_parser(parse_human_size),
+                )
+                .arg(
+                    opt(
+                        "max-cas-age",
+                        "Deletes cargo-cas artifact entries that have not been used \
+                        since the given age (unstable)",
+                    )
+                    .value_name("DURATION")
+                    .value_parser(parse_time_span),
+                )
+                .arg(
+                    opt(
+                        "max-cas-size",
+                        "Deletes cargo-cas artifact entries until the cache is under the \
+                        given size (unstable)",
+                    )
+                    .value_name("SIZE")
+                    .value_parser(parse_human_size),
                 ),
         )
         .after_help(color_print::cstr!(
@@ -193,13 +211,15 @@ fn gc(gctx: &GlobalContext, args: &ArgMatches) -> CliResult {
         max_crate_size: size_opt("max-crate-size"),
         max_git_size: size_opt("max-git-size"),
         max_download_size: size_opt("max-download-size"),
+        max_cas_age: duration_opt("max-cas-age"),
+        max_cas_size: size_opt("max-cas-size"),
     };
     if let Some(age) = duration_opt("max-download-age") {
         gc_opts.set_max_download_age(age);
     }
     // If the user sets any options, then only perform the options requested.
     // If no options are set, do the default behavior.
-    if !gc_opts.is_download_cache_opt_set() {
+    if !gc_opts.is_gc_opt_set() {
         gc_opts.update_for_auto_gc(gctx)?;
     }
 
