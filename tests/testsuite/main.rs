@@ -26,6 +26,8 @@ mod cargo_add;
 mod cargo_alias_config;
 mod cargo_bench;
 mod cargo_build;
+#[cfg(target_os = "macos")]
+mod cargo_cas;
 mod cargo_check;
 mod cargo_clean;
 mod cargo_command;
@@ -105,9 +107,9 @@ mod fix_n_times;
 mod freshness;
 mod freshness_checksum;
 mod future_incompat_report;
-mod generate_lockfile;
 #[cfg(target_os = "macos")]
 mod gate1_relocatability;
+mod generate_lockfile;
 mod git;
 mod git_auth;
 mod git_gc;

@@ -886,6 +886,7 @@ unstable_cli_options!(
     build_std: Option<Vec<String>>  = ("Enable Cargo to compile the standard library itself as part of a crate graph compilation"),
     #[serde(deserialize_with = "deserialize_comma_separated_list")]
     build_std_features: Option<Vec<String>>  = ("Configure features enabled for the standard library itself when building the standard library"),
+    cargo_cas: bool = ("Enable the experimental immutable registry artifact cache"),
     cargo_lints: bool = ("Enable the `[lints.cargo]` table"),
     checksum_freshness: bool = ("Use a checksum to determine if output is fresh rather than filesystem mtime"),
     codegen_backend: bool = ("Enable the `codegen-backend` option in profiles in .cargo/config.toml file"),
@@ -1434,6 +1435,7 @@ impl CliUnstable {
             "build-analysis" => self.build_analysis = parse_empty(k, v)?,
             "build-std" => self.build_std = Some(parse_list(v)),
             "build-std-features" => self.build_std_features = Some(parse_list(v)),
+            "cargo-cas" => self.cargo_cas = parse_empty(k, v)?,
             "cargo-lints" => self.cargo_lints = parse_empty(k, v)?,
             "codegen-backend" => self.codegen_backend = parse_empty(k, v)?,
             "direct-minimal-versions" => self.direct_minimal_versions = parse_empty(k, v)?,

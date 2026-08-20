@@ -32,6 +32,7 @@ pub mod artifact;
 mod build_config;
 pub(crate) mod build_context;
 pub(crate) mod build_runner;
+mod cas;
 mod compilation;
 mod compile_kind;
 mod crate_type;
@@ -216,7 +217,14 @@ fn compile<'gctx>(
             let force = exec.force_rebuild(unit) || force_rebuild;
             let mut job = fingerprint::prepare_target(build_runner, unit, force)?;
             job.before(if job.freshness().is_dirty() {
-                let work = if unit.mode.is_doc() || unit.mode.is_doc_scrape() {
+                let cache_entry = if !force {
+                    cas::lookup(build_runner, unit)?
+                } else {
+                    None
+                };
+                let work = if let Some(entry) = cache_entry {
+                    cas::restore_work(build_runner, unit, entry)?
+                } else if unit.mode.is_doc() || unit.mode.is_doc_scrape() {
                     rustdoc(build_runner, unit)?
                 } else {
                     rustc(build_runner, unit, exec)?
@@ -350,6 +358,7 @@ fn rustc(
         trim_paths::write_unremap_file(&mut buf, build_runner, unit)?;
         Some(buf)
     };
+    let cas_publication = cas::publication(build_runner, unit)?;
 
     let hide_diagnostics_for_scrape_unit = build_runner.bcx.unit_can_fail_for_docscraping(unit)
         && !matches!(
@@ -542,6 +551,10 @@ fn rustc(
             for output in outputs.iter() {
                 paths::set_file_time_no_err(&output.path, timestamp);
             }
+        }
+
+        if let Some(publication) = cas_publication {
+            publication.publish();
         }
 
         Ok(())
