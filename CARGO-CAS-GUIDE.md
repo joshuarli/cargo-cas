@@ -73,24 +73,46 @@ python3 scripts/benchmark-ish-cas.py
 
 The harness builds `test --workspace --all-targets --all-features --no-run`,
 which is intentionally broader than `cargo build`. Set `CARGO_CAS_RESULTS` to
-keep its JSON history outside the repository. It reports both raw target-plus-
-cache accounting and a CoW-aware estimate; macOS clone-on-write restores make
-the raw number look larger than the physical shared footprint.
+keep its JSON history outside the repository. It reports logical size,
+per-tree apparent allocation, and the actual allocated footprint with
+hardlinked inodes counted once. Its separate CoW-aware estimate is diagnostic
+only; do not use it as the storage result.
 
 ## Interpreting results
 
 Only native-host, pure-Rust `lib`/`rlib` build units are currently eligible.
 Bins, examples, tests, build scripts, proc macros, non-host targets, and root
-application outputs remain local. A cache hit materializes the artifact back
-into Cargo's normal target directory, so a successful hit does not make
-`target/` empty. Cache `miss` means no entry was available; `reject` means a
-present entry failed validation and Cargo safely compiled the unit normally.
+application outputs remain local. A cache hit materializes the artifact at
+Cargo's normal target path, so a successful hit does not make `target/` empty.
+On the same filesystem, validated `.rmeta` and `.rlib` files are read-only
+hardlinks to the immutable cache entry; Cargo-local dep-info and diagnostics
+remain target-local. A target therefore continues to work after cache GC or a
+cache-entry deletion, and a later dirty build detaches the readonly output
+before rustc writes it. Cache `miss` means no entry was available; `reject`
+means a present entry failed validation and Cargo safely compiled the unit
+normally.
 
-As a verified reference point, the committed `epsh`/`ish` configuration
-produced fresh vanilla targets of about 45 MiB and 56 MiB. The corresponding
-cargo-cas targets were about 44 MiB and 55 MiB, with a 29 MiB shared cache;
-`epsh` reported 9 eligible misses and `ish` reported 5 hits, 1 miss, and 8
-conservative rejects. The smaller cache after profile, lockfile, and feature
-alignment is real improvement, but root binaries and artifact-name validation
-still bound the savings. Inspect `CARGO_LOG=cargo::compiler::cas=debug` when a
-hit rate or footprint is surprising.
+For a completed linkable `.rlib` entry, Cargo also removes only that library's
+matching adjacent `*.rcgu.o` intermediates. Those objects are already members
+of the archive; fingerprints, dep-info, metadata, final binaries, and all
+non-cacheable output stay local.
+
+Measure storage across the full target-plus-cache set. Report both logical
+file length and filesystem-allocated blocks, counting a hardlinked inode once
+across that set. Do not use clonefile/CoW estimates as the storage result.
+Use explicit GC to bound the global cache, for example:
+
+```sh
+cargo clean gc -Zgc --max-cas-size=20GiB
+```
+
+The checked-in `scripts/demo-path-cas.py` is the reference fresh-run harness
+for the committed `epsh`/`ish` pair. On the pinned nightly it measured 100.81
+MiB vanilla allocated storage versus 52.85 MiB cargo-cas storage (C = 0.524),
+with hardlinked inodes counted once across both targets and the cache. The CAS
+targets had 79.81 MiB logical data, the cache had 35.22 MiB logical data, and
+their apparent allocations were intentionally higher because both names refer
+to some of the same immutable inodes. `cargo clean gc -Zgc --max-cas-size=0`
+then reduced that isolated 35.32 MiB cache to zero; existing target artifacts
+remain valid. Inspect `CARGO_LOG=cargo::compiler::cas=debug` when a hit rate or
+footprint is surprising.

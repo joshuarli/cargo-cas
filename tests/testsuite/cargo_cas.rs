@@ -455,6 +455,59 @@ fn assert_valid_cache_entry(entry: &Path) {
     }
 }
 
+/// Compiler artifacts backed by the immutable CAS use one inode in the cache
+/// and every Cargo target that consumes that exact action. The manifest keeps
+/// the destination-specific filename, so locate it below the target rather
+/// than assuming Cargo's build-directory layout.
+fn assert_cache_artifacts_share_target(entry: &Path, target: &Path) {
+    let manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(entry.join("manifest.json")).unwrap()).unwrap();
+    for artifact in manifest["artifacts"].as_array().unwrap() {
+        let role = artifact["role"].as_str().unwrap();
+        if !matches!(role, "rmeta" | "linkable") {
+            continue;
+        }
+        let output_name = artifact["output_file_name"].as_str().unwrap();
+        let target_artifact = walkdir::WalkDir::new(target)
+            .into_iter()
+            .filter_map(Result::ok)
+            .find(|candidate| {
+                candidate.file_type().is_file() && candidate.file_name() == output_name
+            })
+            .map(|candidate| candidate.into_path())
+            .unwrap_or_else(|| {
+                panic!("target {target:?} does not contain cached {role} {output_name}")
+            });
+        let cache_artifact = entry
+            .join("artifacts")
+            .join(artifact["file"].as_str().unwrap());
+        assert!(
+            same_file::is_same_file(&cache_artifact, &target_artifact).unwrap(),
+            "cache artifact {cache_artifact:?} and target artifact {target_artifact:?} must share one inode"
+        );
+        assert!(
+            cache_artifact.metadata().unwrap().permissions().readonly(),
+            "a cache-backed compiler artifact must remain read-only"
+        );
+        if role == "linkable" {
+            let rlib_stem = Path::new(output_name).file_stem().unwrap().to_str().unwrap();
+            let codegen_prefix = format!("{}.", rlib_stem.strip_prefix("lib").unwrap());
+            let output_directory = target_artifact.parent().unwrap();
+            assert!(
+                fs::read_dir(output_directory)
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .all(|entry| {
+                        let name = entry.file_name();
+                        let name = name.to_string_lossy();
+                        !name.starts_with(&codegen_prefix) || !name.ends_with(".rcgu.o")
+                    }),
+                "a reusable rlib already archives its own codegen objects; Cargo must not retain them beside {target_artifact:?}"
+            );
+        }
+    }
+}
+
 #[cargo_test]
 fn registry_check_cache_reuses_only_matching_action_inputs() {
     registry::init();
@@ -492,7 +545,7 @@ pub fn answer() -> u32 { 41 }
     let manifest = cache_manifest();
     let manifest_json: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&manifest).unwrap()).unwrap();
-    assert_eq!(manifest_json["format_version"], 5);
+    assert_eq!(manifest_json["format_version"], 6);
     assert_eq!(manifest_json["identity"]["target_name"], REGISTRY_CRATE);
     assert_eq!(manifest_json["identity"]["compile_mode"], "check");
     assert!(manifest_json["identity"]["package_id"].is_string());
@@ -535,7 +588,7 @@ pub fn answer() -> u32 { 41 }
     );
     let rebuilt_manifest: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&manifest).unwrap()).unwrap();
-    assert_eq!(rebuilt_manifest["format_version"], 5);
+    assert_eq!(rebuilt_manifest["format_version"], 6);
 
     let exact_output = run_check(&exact, &paths::root().join("cas-exact-target"), "");
     assert!(
@@ -765,6 +818,142 @@ edition = "2024"
 }
 
 #[cargo_test]
+fn cargo_metadata_arguments_keep_root_and_dependency_actions_distinct() {
+    let producer = project_in("cas-metadata-producer")
+        .file(
+            "Cargo.toml",
+            r#"[package]
+name = "cas-metadata-producer"
+version = "0.1.0"
+edition = "2024"
+"#,
+        )
+        .file("src/lib.rs", "pub fn answer() -> u32 { 42 }\n")
+        .build();
+    let consumer = project_in("cas-metadata-consumer")
+        .file(
+            "Cargo.toml",
+            r#"[package]
+name = "cas-metadata-consumer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cas-metadata-producer = { path = "../../cas-metadata-producer/foo" }
+"#,
+        )
+        .file(
+            "src/main.rs",
+            "fn main() { println!(\"{}\", cas_metadata_producer::answer()); }\n",
+        )
+        .build();
+
+    let producer_output = run_build(
+        &producer,
+        &paths::root().join("cas-metadata-producer-target"),
+    );
+    assert!(
+        crate_was_compiled(&producer_output, "cas_metadata_producer"),
+        "the standalone library should populate its own action:\n{}",
+        String::from_utf8_lossy(&producer_output.stderr)
+    );
+
+    let consumer_output = run_check_with_cas_log(
+        &consumer,
+        &paths::root().join("cas-metadata-consumer-target"),
+    );
+    assert!(
+        crate_was_compiled(&consumer_output, "cas_metadata_producer"),
+        "a different Cargo metadata argument must compile a distinct action:\n{}",
+        String::from_utf8_lossy(&consumer_output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&consumer_output.stderr);
+    assert!(
+        !stderr.contains("cargo-cas reject: unexpected artifacts"),
+        "different compiler metadata is an action miss, not an artifact-name rejection:\n{stderr}"
+    );
+
+    let cache_root = paths::cargo_home().join("cache/cargo-cas-v1");
+    let entries = fs::read_dir(&cache_root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().join("manifest.json").is_file())
+        .count();
+    assert_eq!(
+        entries, 2,
+        "the root and dependency compiler contracts must retain separate immutable entries"
+    );
+}
+
+#[cargo_test]
+fn source_edit_detaches_readonly_cache_backed_output_before_rustc() {
+    const CRATE: &str = "cas_hardlink_source_edit";
+
+    let project = project_in("cas-hardlink-source-edit")
+        .file(
+            "Cargo.toml",
+            r#"[package]
+name = "cas-hardlink-source-edit"
+version = "0.1.0"
+edition = "2024"
+"#,
+        )
+        .file("src/lib.rs", "pub const ANSWER: u32 = 1;\n")
+        .build();
+    let target = paths::root().join("cas-hardlink-source-edit-target");
+
+    let first_output = run_build(&project, &target);
+    assert!(crate_was_compiled(&first_output, CRATE));
+    let first_manifest = cache_manifest_for_crate(CRATE);
+    let first_entry = first_manifest.parent().unwrap().to_path_buf();
+    assert_cache_artifacts_share_target(&first_entry, &target);
+
+    let unrelated_codegen = target
+        .join("debug")
+        .join("unrelated_unit-1234.cgu.0.rcgu.o");
+    fs::write(&unrelated_codegen, "ordinary target-local state").unwrap();
+
+    // Rustc normally overwrites this output path. A cache materialization made
+    // it read-only and hardlinked, so `Compiler::rustc` must first detach it.
+    // The old entry must remain valid after the new source produces a second
+    // immutable action.
+    fs::write(project.root().join("src/lib.rs"), "pub const ANSWER: u32 = 2;\n").unwrap();
+    let edited_output = run_build(&project, &target);
+    assert!(
+        crate_was_compiled(&edited_output, CRATE),
+        "a source edit must compile a new action rather than reuse stale bytes:\n{}",
+        String::from_utf8_lossy(&edited_output.stderr)
+    );
+    assert_valid_cache_entry(&first_entry);
+    assert!(
+        unrelated_codegen.is_file(),
+        "codegen cleanup must not remove an unrelated Cargo output"
+    );
+
+    let cache_root = paths::cargo_home().join("cache/cargo-cas-v1");
+    let entries = fs::read_dir(&cache_root)
+        .unwrap()
+        .map(Result::unwrap)
+        .map(|entry| entry.path())
+        .filter(|entry| entry.join("manifest.json").is_file())
+        .filter(|entry| {
+            serde_json::from_str::<serde_json::Value>(
+                &fs::read_to_string(entry.join("manifest.json")).unwrap(),
+            )
+            .unwrap()["identity"]["crate_name"]
+                .as_str()
+                .is_some_and(|name| name == CRATE)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(entries.len(), 2, "the source edit must publish a new action");
+    let edited_entry = entries
+        .iter()
+        .find(|entry| **entry != first_entry)
+        .expect("the edited action has a distinct cache entry");
+    assert_cache_artifacts_share_target(edited_entry, &target);
+}
+
+#[cargo_test]
 fn git_worktree_path_dependencies_share_one_cargo_cas_action() {
     let project = project_in("cas-path-worktree-sharing")
         .file(
@@ -968,7 +1157,7 @@ pub fn noop(_input: TokenStream) -> TokenStream { TokenStream::new() }
     let build_script_manifest = build_script_cache_manifest(BUILD_SCRIPT_PACKAGE);
     let build_script_manifest_json: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(build_script_manifest).unwrap()).unwrap();
-    assert_eq!(build_script_manifest_json["format_version"], 5);
+    assert_eq!(build_script_manifest_json["format_version"], 6);
     assert_eq!(build_script_manifest_json["files"].as_array().unwrap().len(), 1);
     assert!(build_script_manifest_json["output"]
         .as_str()
@@ -1543,6 +1732,8 @@ edition = "2024"
         ["rmeta", "linkable", "dep-info"],
         "a cache hit must restore metadata before linkable and local bookkeeping files"
     );
+    let cache_entry = manifest.parent().unwrap();
+    assert_cache_artifacts_share_target(cache_entry, &first_target);
 
     let second_target = paths::root().join("cas-build-second-target");
     let second_output = run_build(&second, &second_target);
@@ -1556,6 +1747,7 @@ edition = "2024"
         second_target.join("debug/cas-build-second").is_file(),
         "a cache hit must leave Cargo's ordinary final binary intact"
     );
+    assert_cache_artifacts_share_target(cache_entry, &second_target);
 
     // A dependency hit must also preserve Cargo's ordinary artifact export
     // path. The root binary is always built and exported locally; only the
@@ -1580,6 +1772,18 @@ edition = "2024"
         "the root binary must be exported through Cargo's normal artifact-dir path"
     );
 
+    // A target directory is purely a materialization. Removing it must not
+    // affect a valid cache entry, and the next CAS build should restore the
+    // dependency without compiling it again.
+    fs::remove_dir_all(&second_target).unwrap();
+    let after_target_removal = run_build(&second, &second_target);
+    assert!(
+        !crate_was_compiled(&after_target_removal, BUILD_CRATE),
+        "removing a target directory must still permit a dependency cache hit:\n{}",
+        String::from_utf8_lossy(&after_target_removal.stderr)
+    );
+    assert_cache_artifacts_share_target(cache_entry, &second_target);
+
     // The materialized artifacts and normal fingerprint state are also usable
     // by an invocation that does not opt into cargo-cas.  This guards the
     // scheduler boundary: a cache hit is normal local Cargo state, not a
@@ -1594,6 +1798,18 @@ edition = "2024"
         !crate_was_compiled(&normal_output, "cas_build_second"),
         "the normal final artifact should remain fresh after a cache hit:\n{}",
         String::from_utf8_lossy(&normal_output.stderr)
+    );
+
+    // A target owns a hardlink, not a reference which becomes dangling when
+    // explicit cache GC or a user removes the backing entry. Normal Cargo
+    // must therefore still accept the target's complete local fingerprint and
+    // artifact state after the cache itself is gone.
+    fs::remove_dir_all(cache_entry).unwrap();
+    let after_cache_removal = run_normal_build(&second, &second_target);
+    assert!(
+        !crate_was_compiled(&after_cache_removal, BUILD_CRATE),
+        "removing a cache entry must not invalidate a materialized target:\n{}",
+        String::from_utf8_lossy(&after_cache_removal.stderr)
     );
 }
 
@@ -2077,7 +2293,11 @@ edition = "2024"
     // A regular artifact whose digest no longer matches the manifest is also
     // corrupt.  Cargo must reject it, rebuild normally, and make the repaired
     // immutable entry available to the following workspace.
-    fs::write(entry.join("artifacts/0"), b"corrupt artifact").unwrap();
+    let corrupt_artifact = entry.join("artifacts/0");
+    let mut corrupt_permissions = fs::metadata(&corrupt_artifact).unwrap().permissions();
+    corrupt_permissions.set_readonly(false);
+    fs::set_permissions(&corrupt_artifact, corrupt_permissions).unwrap();
+    fs::write(&corrupt_artifact, b"corrupt artifact").unwrap();
     let corrupt = project_in("cas-gate-four-corrupt")
         .file("Cargo.toml", &manifest)
         .file(
@@ -2164,6 +2384,9 @@ edition = "2024"
     );
     assert!(!crate_was_compiled(&missing_repaired_output, CRATE));
 
+    let mut truncated_permissions = fs::metadata(&artifact).unwrap().permissions();
+    truncated_permissions.set_readonly(false);
+    fs::set_permissions(&artifact, truncated_permissions).unwrap();
     fs::write(&artifact, b"truncated").unwrap();
     let truncated_output = run_check(
         &partial,

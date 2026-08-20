@@ -33,11 +33,12 @@ use crate::util::CargoResult;
 use crate::workspace::{PackageId, Target};
 use cargo_util_schemas::manifest::RustVersion;
 
-// Version 5 records entries after resolving rustup proxies from Cargo's
-// invocation directory. Older entries may have been compiled by a different
-// rustup override after Cargo changed each child process's cwd, so they must
-// be rebuilt rather than accepted as a partial hit.
-const CACHE_FORMAT_VERSION: u8 = 5;
+// Version 6 records Cargo's `-C metadata` and `-C extra-filename` arguments.
+// Those arguments change the bytes in a Rust library when the same package is
+// compiled as a standalone root versus as a dependency. Older entries could
+// therefore have the right source and profile but the wrong artifact bytes,
+// so they must be rebuilt rather than accepted as a partial hit.
+const CACHE_FORMAT_VERSION: u8 = 6;
 const CACHE_DIRECTORY: &str = "cargo-cas-v1";
 const MANIFEST_FILE: &str = "manifest.json";
 const ARTIFACTS_DIRECTORY: &str = "artifacts";
@@ -550,6 +551,11 @@ struct CompilerContractInput {
     checksum_freshness: bool,
     embeds_metadata: bool,
     linker: Option<String>,
+    /// Cargo derives these two rustc arguments from its local unit graph.
+    /// They affect both compiler output bytes and output filenames, so an
+    /// immutable action must not share across differing values.
+    rustc_metadata: String,
+    rustc_extra_filename: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -671,11 +677,24 @@ enum ArtifactRole {
     OutputCache,
 }
 
+impl ArtifactRole {
+    /// Only rustc's immutable library outputs may share a cache inode. Cargo
+    /// owns translated dep-info and diagnostic replay state, both of which
+    /// stay destination-local even on a cache hit.
+    fn supports_hardlink_materialization(self) -> bool {
+        matches!(self, Self::Rmeta | Self::Linkable)
+    }
+}
+
 #[derive(Clone)]
 struct ArtifactPath {
     role: ArtifactRole,
     source: PathBuf,
     destination: PathBuf,
+    /// Cargo's normal post-compile uplift destination. When an eligible root
+    /// library is cache-backed, keeping this path on the same immutable inode
+    /// avoids immediately recreating a second APFS clone in `link_targets`.
+    uplift: Option<PathBuf>,
     /// Compiler diagnostics are optional because Cargo creates an output cache
     /// lazily, only when rustc actually emits a cacheable message. All other
     /// entry members are required for a valid reusable action.
@@ -839,6 +858,7 @@ impl CacheAction {
                 (
                     entry.root.join(ARTIFACTS_DIRECTORY).join(&cached.file),
                     expected.destination.clone(),
+                    expected.uplift.clone(),
                     cached.role,
                     cached.size,
                     cached.digest.clone(),
@@ -849,13 +869,17 @@ impl CacheAction {
 
         Work::new(move |state| {
             let restored: CargoResult<()> = (|| {
-                for (source, destination, role, size, digest) in restores {
+                for (source, destination, uplift, role, size, digest) in restores {
                     let parent = destination.parent().expect("Cargo output path has parent");
                     paths::create_dir_all(parent)?;
-                    // Cache entries are immutable. Copy rather than hardlink so a
-                    // later local output cleanup or compiler invocation can never
-                    // mutate a globally cached inode.
-                    copy_verified_artifact(&source, &destination, size, &digest)?;
+                    materialize_verified_artifact(
+                        &source,
+                        &destination,
+                        uplift.as_deref(),
+                        role,
+                        size,
+                        &digest,
+                    )?;
                     if role == ArtifactRole::Rmeta {
                         // Pipelined metadata consumers can begin as soon as
                         // the restored `.rmeta` is locally available. The
@@ -1015,6 +1039,7 @@ impl CachePublication {
         let final_entry = self.cache.join(self.key.as_str());
         if fs::symlink_metadata(&final_entry).is_ok() {
             if entry_is_valid(&final_entry, &self.key, &self.identity, &self.artifacts) {
+                self.materialize_shared_artifacts(&final_entry)?;
                 mark_used(&self.cache, self.key.as_str());
                 return Ok(());
             }
@@ -1044,6 +1069,9 @@ impl CachePublication {
             let cache_name = index.to_string();
             let staged = temporary_artifacts.join(&cache_name);
             fs::copy(&artifact.source, &staged)?;
+            if artifact.role.supports_hardlink_materialization() {
+                make_readonly(&staged)?;
+            }
             let metadata = fs::metadata(&staged)?;
             let digest = digest_file(&staged)?;
             manifest_artifacts.push(CachedArtifact {
@@ -1083,7 +1111,82 @@ impl CachePublication {
         if temporary_entry.exists() {
             let _ = fs::remove_dir_all(&temporary_entry);
         }
+        self.materialize_shared_artifacts(&final_entry)?;
         mark_used(&self.cache, self.key.as_str());
+        Ok(())
+    }
+
+    /// Replaces only the immutable compiler-output roles after final entry
+    /// validation. The local dep-info and diagnostic files remain ordinary
+    /// target files, preserving Cargo's destination-local bookkeeping.
+    fn materialize_shared_artifacts(&self, entry: &Path) -> CargoResult<()> {
+        let manifest_path = entry.join(MANIFEST_FILE);
+        let manifest = serde_json::from_slice::<CacheManifestV1>(&read_regular_file(&manifest_path)?)?;
+        if !manifest_matches_expected(&manifest, &self.artifacts) {
+            return Err(io::Error::other("published cargo-cas entry changed output shape").into());
+        }
+        for cached in &manifest.artifacts {
+            if !cached.role.supports_hardlink_materialization() {
+                continue;
+            }
+            let expected = self
+                .artifacts
+                .iter()
+                .find(|expected| artifact_matches_expected(cached, expected))
+                .expect("validated cargo-cas manifest matches expected artifacts");
+            let destination_parent = expected
+                .destination
+                .parent()
+                .expect("Cargo output path has parent");
+            paths::create_dir_all(destination_parent)?;
+            let source = entry.join(ARTIFACTS_DIRECTORY).join(&cached.file);
+            hardlink_verified_artifact(&source, &expected.destination, cached.size, &cached.digest)?;
+            if let Some(uplift) = &expected.uplift {
+                let parent = uplift.parent().expect("Cargo uplift path has parent");
+                paths::create_dir_all(parent)?;
+                hardlink_verified_artifact(&source, uplift, cached.size, &cached.digest)?;
+            }
+        }
+        self.remove_archived_codegen_objects()?;
+        Ok(())
+    }
+
+    /// An `.rlib` already contains every `*.rcgu.o` member rustc emitted for
+    /// this cacheable library action. Once the complete immutable `.rlib` is
+    /// validated and materialized, leaving those adjacent intermediate object
+    /// files only duplicates bytes; Cargo's fingerprints, dep-info, rmeta,
+    /// rlib, and final outputs all remain in place. Restrict removal to the
+    /// exact output-name prefix rustc uses for each validated linkable role.
+    fn remove_archived_codegen_objects(&self) -> CargoResult<()> {
+        let codegen_prefixes = self
+            .artifacts
+            .iter()
+            .filter(|artifact| artifact.role == ArtifactRole::Linkable)
+            .filter_map(|artifact| {
+                let directory = artifact.destination.parent()?.to_path_buf();
+                let rlib_stem = artifact.destination.file_stem()?.to_str()?;
+                let crate_stem = rlib_stem.strip_prefix("lib").unwrap_or(rlib_stem);
+                Some((directory, format!("{crate_stem}.")))
+            })
+            .collect::<BTreeSet<_>>();
+        for (output_directory, codegen_prefix) in codegen_prefixes {
+            let Ok(entries) = fs::read_dir(&output_directory) else {
+                continue;
+            };
+            for entry in entries.filter_map(Result::ok) {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if !name.starts_with(&codegen_prefix) || !name.ends_with(".rcgu.o") {
+                    continue;
+                }
+                let path = entry.path();
+                if fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_file()) {
+                    if let Err(error) = fs::remove_file(&path) {
+                        debug!(?error, ?path, "cargo-cas could not remove archived codegen object");
+                    }
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -1357,6 +1460,7 @@ fn compiler_contract_input(
         .into_iter()
         .map(|argument| argument.into_string().ok())
         .collect::<Option<Vec<_>>>()?;
+    let metadata = build_runner.files().metadata(unit);
     Some(CompilerContractInput {
         manifest_lint_rustflags: unit
             .pkg
@@ -1383,6 +1487,8 @@ fn compiler_contract_input(
             .info(unit.kind)
             .should_embed_metadata(),
         linker,
+        rustc_metadata: metadata.c_metadata().to_string(),
+        rustc_extra_filename: metadata.c_extra_filename().map(|value| value.to_string()),
     })
 }
 
@@ -1853,6 +1959,7 @@ fn artifact_paths(
                 role,
                 source: output.path.clone(),
                 destination: output.path.clone(),
+                uplift: output.hardlink.clone(),
                 required: true,
             })
         })
@@ -1862,6 +1969,7 @@ fn artifact_paths(
         role: ArtifactRole::DepInfo,
         source: dep_info.clone(),
         destination: dep_info,
+        uplift: None,
         required: true,
     });
     let output_cache = build_runner.files().message_cache_path(unit);
@@ -1869,6 +1977,7 @@ fn artifact_paths(
         role: ArtifactRole::OutputCache,
         source: output_cache.clone(),
         destination: output_cache,
+        uplift: None,
         required: false,
     });
     // The scheduler may unblock a metadata-only dependent as soon as its
@@ -2155,6 +2264,8 @@ fn validate_manifest(root: &Path, manifest: &CacheManifestV1) -> bool {
         };
         metadata.is_file()
             && metadata.len() == artifact.size
+            && (!artifact.role.supports_hardlink_materialization()
+                || metadata.permissions().readonly())
             && digest_file(&path).is_ok_and(|digest| digest == artifact.digest)
     })
 }
@@ -2225,11 +2336,86 @@ fn open_regular_file(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
-/// Restores an entry artifact through a no-follow descriptor and proves that
-/// the bytes observed at restore time are still the manifest bytes validated at
-/// lookup time. macOS first uses its copy-on-write clone primitive so each
-/// worktree shares immutable cache blocks; other filesystems use the streaming
-/// copy fallback. A clone never shares a mutable inode with Cargo's target.
+/// Restores one verified artifact. Immutable rustc library roles use a
+/// read-only hardlink when both directories are on the same filesystem; Cargo
+/// keeps all local bookkeeping files as independent destination state. The
+/// clone/copy path remains the conservative fallback for every other role and
+/// for filesystems that cannot safely create the link.
+fn materialize_verified_artifact(
+    source: &Path,
+    destination: &Path,
+    uplift: Option<&Path>,
+    role: ArtifactRole,
+    expected_size: u64,
+    expected_digest: &str,
+) -> io::Result<()> {
+    if role.supports_hardlink_materialization() {
+        match hardlink_verified_artifact(source, destination, expected_size, expected_digest) {
+            Ok(()) => {
+                if let Some(uplift) = uplift {
+                    if let Some(parent) = uplift.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    hardlink_verified_artifact(source, uplift, expected_size, expected_digest)?;
+                }
+                debug!("cargo-cas restore: immutable hardlink");
+                return Ok(());
+            }
+            Err(error) => {
+                debug!(error = ?error, "cargo-cas restore: immutable hardlink unavailable; copying");
+            }
+        }
+    }
+    copy_verified_artifact(source, destination, expected_size, expected_digest)
+}
+
+/// Replaces `destination` only after a newly created hardlink has passed the
+/// manifest's regular-file, length, and digest checks. Linking a substituted
+/// symlink produces another symlink, which `verify_artifact` rejects before
+/// it can reach Cargo's target directory.
+fn hardlink_verified_artifact(
+    source: &Path,
+    destination: &Path,
+    expected_size: u64,
+    expected_digest: &str,
+) -> io::Result<()> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| io::Error::other("cargo-cas artifact destination has no parent"))?;
+    let file_name = destination
+        .file_name()
+        .ok_or_else(|| io::Error::other("cargo-cas artifact destination has no file name"))?
+        .to_string_lossy();
+    let temporary = parent.join(format!(
+        ".cargo-cas-link-{file_name}-{}-{}",
+        std::process::id(),
+        TEMPORARY_ENTRY_COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
+    fs::hard_link(source, &temporary)?;
+    if let Err(error) = verify_artifact(&temporary, expected_size, expected_digest) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if let Err(error) = fs::rename(&temporary, destination) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Cache-backed inodes must not be writable through Cargo's target paths.
+/// Rustc will replace a dirty output atomically; the local output directory
+/// remains writable, while this immutable file denies in-place mutation.
+fn make_readonly(path: &Path) -> io::Result<()> {
+    let mut permissions = fs::metadata(path)?.permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(path, permissions)
+}
+
+/// Restores a non-shared entry artifact through a no-follow descriptor and
+/// proves that the bytes observed at restore time are still the manifest bytes
+/// validated at lookup time. macOS first uses its copy-on-write clone primitive
+/// and other filesystems use the streaming-copy fallback.
 fn copy_verified_artifact(
     source: &Path,
     destination: &Path,

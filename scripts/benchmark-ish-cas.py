@@ -251,9 +251,30 @@ def external_path_dependencies(
 
 
 def allocated_bytes(root: Path) -> int:
-    """Return physical file usage without following symlinks."""
+    """Return apparent allocated bytes for one tree without following symlinks."""
 
     return sum(allocated_file_bytes(stat) for _, stat in regular_files(root))
+
+
+def unique_allocated_bytes(roots: list[Path]) -> int:
+    """Return actual allocated blocks across a complete storage set.
+
+    cargo-cas can materialize immutable compiler artifacts as read-only
+    hardlinks. An inode shared by a target and the cache occupies filesystem
+    blocks once, so count it once here rather than treating that physical
+    sharing as a CoW estimate.
+    """
+
+    seen: set[tuple[int, int]] = set()
+    total = 0
+    for root in roots:
+        for _, stat in regular_files(root):
+            inode = (stat.st_dev, stat.st_ino)
+            if inode in seen:
+                continue
+            seen.add(inode)
+            total += allocated_file_bytes(stat)
+    return total
 
 
 def regular_files(root: Path):
@@ -1136,10 +1157,16 @@ def main() -> int:
             logical_bytes(worktree / "target") for worktree in worktrees
         )
         storage_cache_bytes = allocated_bytes(cache_root)
+        storage_cache_logical_bytes = logical_bytes(cache_root)
         cached_signatures = cache_signatures(cache_root)
         storage_uncached_bytes = uncached_target_bytes(worktrees, cached_signatures)
         storage_cow_total_bytes = storage_cache_bytes + storage_uncached_bytes
-        storage_measured_footprint_bytes = storage_target_bytes + storage_cache_bytes
+        storage_measured_footprint_bytes = unique_allocated_bytes(
+            [*(worktree / "target" for worktree in worktrees), cache_root]
+        )
+        storage_logical_footprint_bytes = (
+            storage_target_logical_bytes + storage_cache_logical_bytes
+        )
         storage_cow_multiplier = (
             storage_cow_total_bytes / storage_target_logical_bytes
             if storage_target_logical_bytes
@@ -1152,10 +1179,19 @@ def main() -> int:
         )
         storage_cache_entries = cache_entry_count(cache_root)
         print("\nstorage (after final rebuild)")
-        print(f"  four local target directories: {format_bytes(storage_target_bytes)}")
-        print(f"  shared cargo-cas cache:         {format_bytes(storage_cache_bytes)}")
+        print(
+            "  four local target directories: "
+            f"logical {format_bytes(storage_target_logical_bytes)}, "
+            f"apparent allocated {format_bytes(storage_target_bytes)}"
+        )
+        print(
+            "  shared cargo-cas cache:         "
+            f"logical {format_bytes(storage_cache_logical_bytes)}, "
+            f"allocated {format_bytes(storage_cache_bytes)}"
+        )
+        print(f"  full logical footprint:          {format_bytes(storage_logical_footprint_bytes)}")
         print(f"  target-local non-cache bytes:   {format_bytes(storage_uncached_bytes)}")
-        print(f"  measured footprint:             {format_bytes(storage_measured_footprint_bytes)}")
+        print(f"  allocated physical footprint:   {format_bytes(storage_measured_footprint_bytes)}")
         print(f"  measured footprint multiplier:  {storage_measured_multiplier:.3f}x")
         print(f"  CoW-aware shared footprint:     {format_bytes(storage_cow_total_bytes)}")
         print(f"  CoW-aware multiplier:           {storage_cow_multiplier:.3f}x")
@@ -1229,8 +1265,11 @@ def main() -> int:
                 for reason, packages in rebuild.skip_packages.items()
             },
             "storage_target_bytes": storage_target_bytes,
+            "storage_target_logical_bytes": storage_target_logical_bytes,
             "storage_cache_bytes": storage_cache_bytes,
+            "storage_cache_logical_bytes": storage_cache_logical_bytes,
             "storage_uncached_target_bytes": storage_uncached_bytes,
+            "storage_logical_footprint_bytes": storage_logical_footprint_bytes,
             "storage_measured_footprint_bytes": storage_measured_footprint_bytes,
             "storage_measured_multiplier": storage_measured_multiplier,
             "storage_cow_footprint_bytes": storage_cow_total_bytes,
@@ -1254,7 +1293,7 @@ def main() -> int:
         )
         print("\nrepeatability notes")
         print("  timing rounds prune their newly published root entries before storage sampling")
-        print("  measured footprint sums target and cache file blocks")
+        print("  allocated physical footprint counts hardlinked inodes once across target and cache")
         print("  CoW-aware footprint counts cache-matching target files once")
         print("  restores use macOS clonefile, so raw file accounting overcounts shared blocks")
         print("  rustc counts and CAS decisions are read from retained temporary logs")

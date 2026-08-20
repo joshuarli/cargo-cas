@@ -222,7 +222,8 @@ The key records:
   rustflags, and extra compiler arguments;
 * a compiler-contract section containing manifest lint flags, generated
   `--check-cfg`, cap-lints, allowed unstable features, Cargo lints,
-  dep-info/checksum-freshness switches, metadata embedding, and linker path;
+  dep-info/checksum-freshness switches, metadata embedding, Cargo's
+  `-C metadata` and `-C extra-filename` values, and linker path;
 * strict toolchain identity: canonical rustc executable path, full `rustc
   -vV` text, and sysroot; and
 * recursively sorted dependency action keys plus dependency edge semantics
@@ -262,10 +263,26 @@ a profile change miss.
 CAS therefore transports compiler artifacts, not arbitrary Cargo state. A
 compiler entry contains the required `.rmeta` and, for build mode, linkable
 `.rlib` role, plus validated translated dep-info and an optional Cargo output
-cache. On restore, files are copied into the destination unit paths; local
-fingerprints and other destination bookkeeping are established by Cargo's
-normal job. Incremental directories and final/root outputs are never copied
-from the global entry.
+cache. The `.rmeta` and `.rlib` cache files are made read-only after validation.
+When the target and cache share a filesystem, restore atomically replaces the
+destination compiler outputs with verified hardlinks to those immutable files.
+Cargo-local dep-info and diagnostic state remain independent destination files.
+Local fingerprints and other destination bookkeeping are established by
+Cargo's normal job. Incremental directories and final/root outputs are never
+copied from the global entry.
+
+A hardlinked target remains usable if cache GC or a user deletes the cache
+entry: the target retains its inode. Before ordinary rustc work starts, Cargo
+removes any read-only compiler output in the target, so a source edit or other
+dirty rebuild cannot mutate the cache inode. Filesystems where hardlinking is
+not available fall back to the verified clone/copy materialization path.
+
+After a complete linkable `.rlib` is validated and materialized, Cargo removes
+only that library unit's adjacent `*.rcgu.o` intermediates from its target
+directory (matched by rustc's output-name prefix). The `.rlib` archive already
+contains those codegen members; keeping both copies consumes space without
+contributing to Cargo's fingerprints, dep-info, metadata, or final outputs.
+Metadata-only `check` entries do not perform this cleanup.
 
 The relocatability evidence is macOS-only and does not claim cross-OS,
 cross-target, network-filesystem, or arbitrary debug/path metadata reuse.
@@ -292,7 +309,7 @@ $CARGO_HOME/cache/cargo-cas-v1/
     access/<action-key>              # mutable last-use record
 ```
 
-The current on-disk `CACHE_FORMAT_VERSION` is **5**. The directory name is
+The current on-disk `CACHE_FORMAT_VERSION` is **6**. The directory name is
 kept at `cargo-cas-v1`; the manifest version is the compatibility boundary.
 Compiler manifests contain the action key, a duplicate human-readable
 identity, and artifact records. Each record has a role (`rmeta`, `linkable`,
@@ -304,7 +321,8 @@ generated files.
 Publication is best-effort and follows this protocol:
 
 1. verify eligibility and required source/output state;
-2. copy artifacts into a per-writer directory below `tmp`;
+2. copy artifacts into a per-writer directory below `tmp`, then make shared
+   compiler-output roles read-only;
 3. write the manifest atomically;
 4. validate the staged entry, including sizes, digests, roles, and identity; and
 5. rename the complete directory into the final key path on the same
@@ -324,11 +342,14 @@ of compiling a duplicate. Different keys use different locks.
 
 Cache infrastructure is treated as untrusted mutable state. Root, `locks`,
 `tmp`, `access`, entries, and artifacts are checked with `symlink_metadata`;
-lock opens use no-follow flags where available; restore verifies digest and
-size while copying (using macOS copy-on-write cloning when available, with a
-streaming-copy fallback). Symlink substitution, permission errors, disk-full
-publication, interrupted writers, corrupt manifests, and late entry removal
-all degrade to ordinary Cargo compilation without escaping `CARGO_HOME`.
+lock opens use no-follow flags where available. A shared compiler artifact is
+hardlinked first to a temporary target sibling, then rechecked for regular-file
+type, digest, and size before the temporary file atomically replaces Cargo's
+output path. macOS copy-on-write cloning with a streaming-copy fallback is
+used for target-local roles and when hardlinking is unavailable. Symlink
+substitution, permission errors, disk-full publication, interrupted writers,
+corrupt manifests, and late entry removal all degrade to ordinary Cargo
+compilation without escaping `CARGO_HOME`.
 
 `cargo clean` intentionally does not remove immutable global entries. Explicit
 `cargo clean gc -Zgc --max-cas-age=...` and `--max-cas-size=...` perform CAS

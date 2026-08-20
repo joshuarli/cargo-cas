@@ -54,18 +54,49 @@ def resolve_tool(toolchain: str, name: str) -> Path:
     return Path(result.stdout.strip()).resolve()
 
 
-def allocated_bytes(root: Path) -> int:
-    """Return physical usage without following symlinks into the host cache."""
+def regular_files(root: Path):
+    """Yield regular files without following symlinks into the host cache."""
 
-    total = 0
     if not root.exists():
-        return 0
+        return
     for path in root.rglob("*"):
         try:
             stat = path.lstat()
         except FileNotFoundError:
             continue
         if not path.is_symlink() and path.is_file():
+            yield path, stat
+
+
+def allocated_bytes(root: Path) -> int:
+    """Return apparent allocated bytes for one directory tree."""
+
+    return sum(getattr(stat, "st_blocks", 0) * 512 or stat.st_size for _, stat in regular_files(root))
+
+
+def logical_bytes(root: Path) -> int:
+    """Return the sum of regular-file lengths for one directory tree."""
+
+    return sum(stat.st_size for _, stat in regular_files(root))
+
+
+def unique_allocated_bytes(roots: list[Path]) -> int:
+    """Return filesystem blocks allocated by a set of trees.
+
+    A cache-backed target can contain hardlinks to immutable cache artifacts.
+    Count an inode once across the complete storage set: this is direct
+    filesystem allocation, unlike the separate CoW estimate used by the
+    four-worktree harness.
+    """
+
+    seen: set[tuple[int, int]] = set()
+    total = 0
+    for root in roots:
+        for _, stat in regular_files(root):
+            inode = (stat.st_dev, stat.st_ino)
+            if inode in seen:
+                continue
+            seen.add(inode)
             total += getattr(stat, "st_blocks", 0) * 512 or stat.st_size
     return total
 
@@ -127,7 +158,8 @@ def run_build(
     return {
         "label": label,
         "seconds": elapsed,
-        "target_bytes": allocated_bytes(target_dir),
+        "target_allocated_bytes": allocated_bytes(target_dir),
+        "target_logical_bytes": logical_bytes(target_dir),
         "log": log_path,
     }
 
@@ -185,7 +217,12 @@ def run_sequence(
     rustdoc: Path,
     global_registry: Path,
     trace: bool,
-) -> tuple[list[dict[str, object]], dict[str, dict[str, object]], dict[str, dict[str, object]]]:
+) -> tuple[
+    list[dict[str, object]],
+    dict[str, dict[str, object]],
+    dict[str, dict[str, object]],
+    dict[str, int],
+]:
     root.mkdir(parents=True)
     home = prepare_home(root, global_registry)
     env = make_env(home, rustc, rustdoc, cargo_cas=cargo_cas, trace=trace)
@@ -248,14 +285,36 @@ def run_sequence(
         log_path=logs / "ish.log",
         target_dir=ish_target,
     )
+    fresh_storage = {
+        "epsh_target_logical": logical_bytes(epsh_target),
+        "epsh_target_allocated": allocated_bytes(epsh_target),
+        "ish_target_logical": logical_bytes(ish_target),
+        "ish_target_allocated": allocated_bytes(ish_target),
+        "cache_logical": logical_bytes(cache_root),
+        "cache_allocated": allocated_bytes(cache_root),
+        "total_allocated": unique_allocated_bytes([epsh_target, ish_target, cache_root]),
+    }
+    # This is a warm cache recovery, not a no-op: the Cargo target directory
+    # is gone, so ordinary Cargo recompiles dependencies while cargo-cas must
+    # restore its validated global artifacts into an otherwise empty target.
+    shutil.rmtree(ish_target)
+    warm_ish_result = run_build(
+        label=f"{name} ish target-recovery",
+        command=ish_command,
+        cwd=ish,
+        env=env,
+        log_path=logs / "ish-target-recovery.log",
+        target_dir=ish_target,
+    )
     after_ish = cache_manifests(cache_root)
-    return [epsh_result, ish_result], after_epsh, after_ish
+    return [epsh_result, ish_result, warm_ish_result], after_epsh, after_ish, fresh_storage
 
 
 def print_result(result: dict[str, object]) -> None:
     print(
         f"  {result['label']}: {result['seconds']:.2f}s, "
-        f"target {format_bytes(int(result['target_bytes']))}"
+        f"target logical {format_bytes(int(result['target_logical_bytes']))}, "
+        f"allocated {format_bytes(int(result['target_allocated_bytes']))}"
     )
 
 
@@ -292,7 +351,7 @@ def main() -> int:
     print("  temporary state: " + (str(temp_root) if keep else "cleaned on exit"))
 
     try:
-        regular, _, _ = run_sequence(
+        regular, _, _, regular_storage = run_sequence(
             name="regular",
             root=temp_root / "regular",
             cargo=regular_cargo,
@@ -304,7 +363,7 @@ def main() -> int:
             global_registry=global_registry,
             trace=trace,
         )
-        cas, before_ish, after_ish = run_sequence(
+        cas, before_ish, after_ish, cas_storage = run_sequence(
             name="cargo-cas",
             root=temp_root / "cargo-cas",
             cargo=cargo_cas,
@@ -348,14 +407,52 @@ def main() -> int:
                 ]
                 for summary in summaries:
                     print(f"    {summary}")
-        print(f"  final CAS cache: {format_bytes(allocated_bytes(temp_root / 'cargo-cas' / 'cargo-home' / 'cache' / 'cargo-cas-v1'))}")
+        vanilla_logical = (
+            regular_storage["epsh_target_logical"] + regular_storage["ish_target_logical"]
+        )
+        vanilla_allocated = regular_storage["total_allocated"]
+        cas_target_logical = (
+            cas_storage["epsh_target_logical"] + cas_storage["ish_target_logical"]
+        )
+        cas_target_allocated = (
+            cas_storage["epsh_target_allocated"] + cas_storage["ish_target_allocated"]
+        )
+        cache_logical = cas_storage["cache_logical"]
+        cache_allocated = cas_storage["cache_allocated"]
+        cas_logical = cas_target_logical + cache_logical
+        cas_allocated = cas_storage["total_allocated"]
+
+        print("\nstorage (fresh epsh then ish, before target recovery)")
+        print(
+            f"  vanilla targets: logical {format_bytes(vanilla_logical)}, "
+            f"allocated {format_bytes(vanilla_allocated)}"
+        )
+        print(
+            f"  cargo-cas targets: logical {format_bytes(cas_target_logical)}, "
+            f"apparent allocated {format_bytes(cas_target_allocated)}"
+        )
+        print(
+            f"  cargo-cas cache: logical {format_bytes(cache_logical)}, "
+            f"allocated {format_bytes(cache_allocated)}"
+        )
+        print(
+            f"  cargo-cas total: logical {format_bytes(cas_logical)}, "
+            f"allocated {format_bytes(cas_allocated)} "
+            f"({cas_allocated / vanilla_allocated:.3f}x vanilla)"
+        )
 
         regular_ish = float(regular[1]["seconds"])
         cas_ish = float(cas[1]["seconds"])
         print(f"\nish delta: {cas_ish - regular_ish:+.2f}s ({(cas_ish / regular_ish - 1) * 100:+.1f}%)")
-        regular_total = sum(float(result["seconds"]) for result in regular)
-        cas_total = sum(float(result["seconds"]) for result in cas)
-        print(f"sequence delta: {cas_total - regular_total:+.2f}s")
+        regular_total = sum(float(result["seconds"]) for result in regular[:2])
+        cas_total = sum(float(result["seconds"]) for result in cas[:2])
+        print(f"cold sequence delta: {cas_total - regular_total:+.2f}s")
+        regular_warm = float(regular[2]["seconds"])
+        cas_warm = float(cas[2]["seconds"])
+        print(
+            f"warm target-recovery delta: {cas_warm - regular_warm:+.2f}s "
+            f"({(cas_warm / regular_warm - 1) * 100:+.1f}%)"
+        )
     finally:
         if keep:
             print(f"\nkept demo state: {temp_root}")

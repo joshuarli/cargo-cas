@@ -447,6 +447,17 @@ fn rustc(
         }
 
         for output in outputs.iter() {
+            // A cargo-cas hit can leave an immutable hardlink at Cargo's
+            // ordinary compiler-output path. Rustc may update an existing
+            // rmeta in place on some toolchain paths, so detach any readonly
+            // output before normal work. The target directory remains Cargo
+            // owned and a successful rustc invocation recreates this file.
+            if fs::symlink_metadata(&output.path).is_ok_and(|metadata| {
+                metadata.file_type().is_file() && metadata.permissions().readonly()
+            }) {
+                paths::remove_file(&output.path)?;
+            }
+
             // If there is both an rmeta and rlib, rustc will prefer to use the
             // rlib, even if it is older. Therefore, we must delete the rlib to
             // force using the new rmeta.
