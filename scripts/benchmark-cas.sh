@@ -45,6 +45,13 @@ previous=''
 for argument in "$@"; do
     if [ "$previous" = '--crate-name' ]; then
         printf '%s %s\n' "$CAS_BENCHMARK_LABEL" "$argument" >>"$CAS_BENCHMARK_RUSTC_LOG"
+        case "${CAS_BENCHMARK_RECORD_SCALE_ARGS:-0}:$argument" in
+            1:cas_scaling_app)
+                printf '%s\n' "$@" >"$CAS_BENCHMARK_SCALE_ARGS_FILE"
+                printf '%s\n' "${DYLD_FALLBACK_LIBRARY_PATH:-}" >"$CAS_BENCHMARK_SCALE_DYLIB_PATH_FILE"
+                printf '%s\n' "$PATH" >"$CAS_BENCHMARK_SCALE_PATH_FILE"
+                ;;
+        esac
         case "${CAS_BENCHMARK_HOLD_SCALE:-0}:$argument" in
             1:cas_scale_*)
                 while [ ! -f "$CAS_BENCHMARK_RELEASE_FILE" ]; do sleep 0.02; done
@@ -254,6 +261,9 @@ scaling_jobs=${CARGO_CAS_SCALE_JOBS:-8}
 scaling_workspace="$work_root/cas-scaling"
 scaling_target="$work_root/cas-scaling-target"
 scaling_release="$work_root/cas-scaling.release"
+scaling_args="$work_root/cas-scaling.args"
+scaling_dylib_path="$work_root/cas-scaling.dylib-path"
+scaling_path="$work_root/cas-scaling.path"
 mkdir -p "$scaling_workspace/src"
 cat >"$scaling_workspace/Cargo.toml" <<EOF
 [package]
@@ -296,6 +306,9 @@ scaling_started=$(date +%s)
     cd "$scaling_workspace"
     exec env CARGO_HOME="$cas_home" RUSTC="$rustc_proxy" CAS_BENCHMARK_LABEL=cas-scaling \
         CAS_BENCHMARK_HOLD_SCALE=1 CAS_BENCHMARK_RELEASE_FILE="$scaling_release" \
+        CAS_BENCHMARK_RECORD_SCALE_ARGS=1 CAS_BENCHMARK_SCALE_ARGS_FILE="$scaling_args" \
+        CAS_BENCHMARK_SCALE_DYLIB_PATH_FILE="$scaling_dylib_path" \
+        CAS_BENCHMARK_SCALE_PATH_FILE="$scaling_path" \
         "$cas_bin" check -Zcargo-cas -vv -j "$scaling_jobs" --target-dir "$scaling_target"
 ) >"$work_root/cas-scaling.log" 2>&1 &
 scaling_pid=$!
@@ -325,6 +338,13 @@ elapsed_seconds "$scaling_started" >"$work_root/cas-scaling.seconds"
 
 scaling_cache_bytes=$(($(directory_bytes "$cache_root") - cache_bytes))
 scaling_workspace_bytes=$(directory_bytes "$scaling_target")
+scaling_argument_count=$(wc -l <"$scaling_args" | tr -d ' ')
+scaling_command_bytes=$(wc -c <"$scaling_args" | tr -d ' ')
+scaling_l_paths=$(grep -c '^-L' "$scaling_args" || true)
+scaling_externs=$(grep -c '^--extern$' "$scaling_args" || true)
+scaling_path_entries=$(awk -F: '{ print NF }' "$scaling_path")
+scaling_dylib_entries=$(awk -F: '{ print NF }' "$scaling_dylib_path")
+scaling_files=$(find "$scaling_target" -type f | wc -l | tr -d ' ')
 
 cat <<EOF
 cargo-cas benchmark complete
@@ -352,4 +372,11 @@ scale jobs:                 $scaling_jobs
 peak cargo-cas lock fds:    $scaling_lock_fds
 scale cache bytes:          $scaling_cache_bytes
 scale workspace bytes:      $scaling_workspace_bytes
+scale root argv entries:    $scaling_argument_count
+scale root argv bytes:      $scaling_command_bytes
+scale root -L entries:      $scaling_l_paths
+scale root --extern entries:$scaling_externs
+scale root PATH entries:    $scaling_path_entries
+scale root dylib-path entries: $scaling_dylib_entries
+scale target files:         $scaling_files
 EOF

@@ -79,6 +79,28 @@ git -C "$dependency" commit -qm initial
 revision=$(git -C "$dependency" rev-parse HEAD)
 dependency_url="file://$dependency"
 
+# A second immutable action is populated before the worktree cohort. This
+# separates the two required concurrency cases: worktrees restore this common
+# existing action while coordinating one new feature-selected action above.
+common_dependency="$work_root/cas-demo-common"
+mkdir -p "$common_dependency/src"
+cat >"$common_dependency/Cargo.toml" <<'EOF'
+[package]
+name = "cas-demo-common"
+version = "1.0.0"
+edition = "2024"
+EOF
+cat >"$common_dependency/src/lib.rs" <<'EOF'
+pub fn answer() -> u32 { 7 }
+EOF
+git -C "$common_dependency" init -q
+git -C "$common_dependency" config user.email cargo-cas-demo@example.invalid
+git -C "$common_dependency" config user.name cargo-cas-demo
+git -C "$common_dependency" add Cargo.toml src/lib.rs
+git -C "$common_dependency" commit -qm initial
+common_revision=$(git -C "$common_dependency" rev-parse HEAD)
+common_dependency_url="file://$common_dependency"
+
 make_workspace() {
     workspace=$1
     package_name=$2
@@ -92,9 +114,10 @@ edition = "2024"
 
 [dependencies]
 cas-demo-dep = { git = "$dependency_url", rev = "$revision"$feature_spec }
+cas-demo-common = { git = "$common_dependency_url", rev = "$common_revision" }
 EOF
     cat >"$workspace/src/main.rs" <<'EOF'
-fn main() { println!("{}", cas_demo_dep::answer()); }
+fn main() { println!("{}", cas_demo_dep::answer() + cas_demo_common::answer()); }
 EOF
 }
 
@@ -114,6 +137,14 @@ count_dependency_rustc() {
         return
     fi
     grep -c '^cas_demo_dep$' "$rustc_log" || true
+}
+
+count_common_rustc() {
+    if [ ! -f "$rustc_log" ]; then
+        printf '0'
+        return
+    fi
+    grep -c '^cas_demo_common$' "$rustc_log" || true
 }
 
 count_total_rustc() {
@@ -150,6 +181,8 @@ make_workspace "$workspace_restore" cas-demo-restore ''
 run_check "$workspace_a" "$work_root/target-a" "$work_root/a.log"
 cold_rustc=$(count_dependency_rustc)
 assert_equal 1 "$cold_rustc" 'cold workspace compiles the shared dependency once'
+cold_common_rustc=$(count_common_rustc)
+assert_equal 1 "$cold_common_rustc" 'cold workspace compiles the common dependency once'
 
 run_check "$workspace_b" "$work_root/target-b" "$work_root/b.log"
 warm_rustc=$(count_dependency_rustc)
@@ -190,9 +223,13 @@ done
 
 worktree_rustc=$(count_dependency_rustc)
 assert_equal 3 "$worktree_rustc" 'eight concurrent worktrees compile one new action once'
+worktree_common_rustc=$(count_common_rustc)
+assert_equal "$cold_common_rustc" "$worktree_common_rustc" \
+    'eight concurrent worktrees restore the existing common action'
 worktree_count=8
-requested_dependency_actions=$((4 + worktree_count))
-avoided_invocations=$((requested_dependency_actions - worktree_rustc))
+requested_dependency_actions=$((8 + worktree_count * 2))
+actual_dependency_actions=$((worktree_rustc + worktree_common_rustc))
+avoided_invocations=$((requested_dependency_actions - actual_dependency_actions))
 total_rustc=$(count_total_rustc)
 
 cache_root="$CARGO_HOME/cache/cargo-cas-v1"
@@ -221,5 +258,6 @@ cargo-cas demo complete
   workspace build bytes:        $workspace_bytes
   total rustc invocations:      $total_rustc
   concurrent worktrees:         $worktree_count
-  shared concurrent rustc:      $((worktree_rustc - feature_rustc))
+  shared missing-action rustc:  $((worktree_rustc - feature_rustc))
+  shared existing-action rustc: $((worktree_common_rustc - cold_common_rustc))
 EOF

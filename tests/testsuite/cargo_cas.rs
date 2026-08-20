@@ -264,6 +264,7 @@ fn start_gated_check_in_dir(
         .arg("--target-dir")
         .arg(target_dir)
         .env("RUSTC", rustc)
+        .env("CARGO_LOG", "cargo::compiler::cas=debug")
         .env("CAS_TRIGGER_CRATE", trigger_crate)
         .env("CAS_LOG", log)
         .env("CAS_RELEASE", release)
@@ -378,6 +379,28 @@ fn directory_file_size(path: &Path) -> u64 {
 fn contains_path(bytes: &[u8], path: &Path) -> bool {
     let path = path.to_str().unwrap().as_bytes();
     bytes.windows(path.len()).any(|window| window == path)
+}
+
+fn assert_valid_cache_entry(entry: &Path) {
+    let manifest_path = entry.join("manifest.json");
+    let manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    for artifact in manifest["artifacts"].as_array().unwrap() {
+        let path = entry
+            .join("artifacts")
+            .join(artifact["file"].as_str().unwrap());
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        assert!(
+            metadata.file_type().is_file(),
+            "artifact is not a regular file: {path:?}"
+        );
+        assert_eq!(metadata.len(), artifact["size"].as_u64().unwrap());
+        assert_eq!(
+            blake3::hash(&fs::read(&path).unwrap()).to_hex().as_str(),
+            artifact["digest"].as_str().unwrap(),
+            "artifact digest mismatch: {path:?}"
+        );
+    }
 }
 
 #[cargo_test]
@@ -2458,6 +2481,12 @@ edition = "2024"
         reader_outputs.iter().all(|output| output.status.success()),
         "one of the concurrent cache-reader builds failed: {reader_outputs:#?}"
     );
+    assert!(
+        reader_outputs
+            .iter()
+            .all(|output| { String::from_utf8_lossy(&output.stderr).contains("cargo-cas hit") }),
+        "every reader must observe a verified cache hit: {reader_outputs:#?}"
+    );
     assert_eq!(
         fs::read_to_string(&log).unwrap().lines().count(),
         1,
@@ -2470,6 +2499,7 @@ edition = "2024"
         .unwrap()
         .filter_map(Result::ok)
         .filter(|entry| entry.path().join("manifest.json").is_file())
+        .inspect(|entry| assert_valid_cache_entry(&entry.path()))
         .count();
     let elapsed = start.elapsed();
     let workspace_bytes = (0..WORKTREE_COUNT)
