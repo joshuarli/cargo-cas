@@ -606,6 +606,21 @@ edition = "2024"
         "an eligible cold unit must report an actionable miss:\n{}",
         String::from_utf8_lossy(&first_output.stderr)
     );
+    assert!(
+        String::from_utf8_lossy(&first_output.stderr).contains("cargo-cas summary"),
+        "a completed cache-enabled build must report aggregate cache metrics:\n{}",
+        String::from_utf8_lossy(&first_output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&first_output.stderr).contains("eligible=1"),
+        "the cold build should report its one eligible dependency:\n{}",
+        String::from_utf8_lossy(&first_output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&first_output.stderr).contains("eligible_rustc=1"),
+        "the cold build should report its one eligible compiler invocation:\n{}",
+        String::from_utf8_lossy(&first_output.stderr)
+    );
 
     let second_output = run_check_with_cas_log(
         &second,
@@ -617,6 +632,11 @@ edition = "2024"
         "an eligible warm unit must report a cache hit:\n{}",
         String::from_utf8_lossy(&second_output.stderr)
     );
+    assert!(
+        String::from_utf8_lossy(&second_output.stderr).contains("hits=1"),
+        "the warm build summary should report its cache hit:\n{}",
+        String::from_utf8_lossy(&second_output.stderr)
+    );
 
     let skip_output = run_check_with_cas_log(
         &path_source,
@@ -626,6 +646,11 @@ edition = "2024"
     assert!(
         String::from_utf8_lossy(&skip_output.stderr).contains("cargo-cas skip: path source"),
         "an ineligible unit must report why it was skipped:\n{}",
+        String::from_utf8_lossy(&skip_output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&skip_output.stderr).contains("skips={\"path source\":"),
+        "the summary should aggregate skip reasons:\n{}",
         String::from_utf8_lossy(&skip_output.stderr)
     );
 }

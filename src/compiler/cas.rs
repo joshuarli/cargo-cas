@@ -5,11 +5,12 @@
 //! queue therefore remain the authority for scheduling and freshness; this
 //! module only substitutes the work normally performed by `rustc`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use cargo_util::paths;
@@ -29,6 +30,81 @@ const LOCKS_DIRECTORY: &str = "locks";
 const ACCESS_DIRECTORY: &str = "access";
 
 static TEMPORARY_ENTRY_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Per-Cargo-invocation observability for the experimental cache. Counters are
+/// intentionally process-local: they explain one scheduler run without adding
+/// mutable state to immutable cache entries.
+#[derive(Clone, Default)]
+pub(crate) struct CacheStats(Arc<CacheStatsInner>);
+
+#[derive(Default)]
+struct CacheStatsInner {
+    eligible: AtomicU64,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    rejects: AtomicU64,
+    eligible_rustc: AtomicU64,
+    duplicate_build_avoidance: AtomicU64,
+    skips: Mutex<BTreeMap<&'static str, u64>>,
+}
+
+impl CacheStats {
+    fn eligible(&self) {
+        self.0.eligible.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn hit(&self) {
+        self.0.hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn miss(&self) {
+        self.0.misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn reject(&self) {
+        self.0.rejects.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn eligible_rustc(&self) {
+        self.0.eligible_rustc.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn duplicate_build_avoidance(&self) {
+        self.0
+            .duplicate_build_avoidance
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn skip(&self, reason: &'static str) {
+        let mut skips = self
+            .0
+            .skips
+            .lock()
+            .expect("cargo-cas skip counter poisoned");
+        *skips.entry(reason).or_default() += 1;
+    }
+
+    /// Emits a machine-searchable end-of-build summary only when the cache's
+    /// debug tracing target is enabled. Ordinary Cargo output remains quiet.
+    pub(crate) fn log_summary(&self) {
+        let skips = self
+            .0
+            .skips
+            .lock()
+            .expect("cargo-cas skip counter poisoned")
+            .clone();
+        debug!(
+            eligible = self.0.eligible.load(Ordering::Relaxed),
+            hits = self.0.hits.load(Ordering::Relaxed),
+            misses = self.0.misses.load(Ordering::Relaxed),
+            rejects = self.0.rejects.load(Ordering::Relaxed),
+            eligible_rustc = self.0.eligible_rustc.load(Ordering::Relaxed),
+            duplicate_build_avoidance = self.0.duplicate_build_avoidance.load(Ordering::Relaxed),
+            skips = ?skips,
+            "cargo-cas summary"
+        );
+    }
+}
 
 /// A collision-resistant identity for a pre-compilation action.
 ///
@@ -60,6 +136,7 @@ pub(crate) struct CacheAction {
     identity: ManifestIdentityV1,
     cache: PathBuf,
     artifacts: Vec<ArtifactPath>,
+    stats: CacheStats,
 }
 
 /// The stable inputs needed to publish after the `rustc` work has completed.
@@ -212,6 +289,7 @@ pub(crate) fn prepare(
         None => {
             let reason = ineligibility_reason(build_runner, unit)
                 .unwrap_or("an ineligible dependency action");
+            build_runner.cas_stats.skip(reason);
             debug!(
                 package = %unit.pkg.package_id(),
                 target = %unit.target.name(),
@@ -221,6 +299,9 @@ pub(crate) fn prepare(
         }
     };
     let Some(identity) = manifest_identity(build_runner, unit) else {
+        build_runner
+            .cas_stats
+            .skip("manifest identity could not be represented");
         debug!(
             package = %unit.pkg.package_id(),
             target = %unit.target.name(),
@@ -228,11 +309,13 @@ pub(crate) fn prepare(
         );
         return Ok(None);
     };
+    build_runner.cas_stats.eligible();
     Ok(Some(CacheAction {
         key,
         identity,
         cache: cache_root(build_runner),
         artifacts: artifact_paths(build_runner, unit)?,
+        stats: build_runner.cas_stats.clone(),
     }))
 }
 
@@ -242,11 +325,13 @@ impl CacheAction {
     pub(crate) fn lookup(&self) -> Option<CacheEntry> {
         let root = self.cache.join(self.key.as_str());
         if !is_plain_directory(&root) {
+            self.stats.miss();
             debug!(key = self.key.as_str(), "cargo-cas miss: entry absent");
             return None;
         }
         let manifest_path = root.join(MANIFEST_FILE);
         let Ok(manifest_bytes) = read_regular_file(&manifest_path) else {
+            self.stats.miss();
             debug!(
                 key = self.key.as_str(),
                 "cargo-cas miss: manifest unavailable"
@@ -254,6 +339,7 @@ impl CacheAction {
             return None;
         };
         let Ok(manifest) = serde_json::from_slice::<CacheManifestV1>(&manifest_bytes) else {
+            self.stats.reject();
             warn!(path = %manifest_path.display(), "ignoring malformed cargo-cas cache manifest");
             debug!(
                 key = self.key.as_str(),
@@ -266,6 +352,7 @@ impl CacheAction {
             || manifest.action_key != self.key.as_str()
             || manifest.identity != self.identity
         {
+            self.stats.reject();
             warn!(path = %manifest_path.display(), "ignoring incompatible cargo-cas cache manifest");
             debug!(
                 key = self.key.as_str(),
@@ -274,11 +361,13 @@ impl CacheAction {
             return None;
         }
         if !validate_manifest(&root, &manifest) {
+            self.stats.reject();
             warn!(path = %manifest_path.display(), "ignoring corrupt cargo-cas cache entry");
             debug!(key = self.key.as_str(), "cargo-cas reject: corrupt entry");
             return None;
         }
         if !manifest_matches_expected(&manifest, &self.artifacts) {
+            self.stats.reject();
             warn!(path = %manifest_path.display(), "ignoring cargo-cas entry with unexpected artifacts");
             debug!(
                 key = self.key.as_str(),
@@ -288,6 +377,7 @@ impl CacheAction {
         }
 
         mark_used(&self.cache, self.key.as_str());
+        self.stats.hit();
         debug!(key = self.key.as_str(), "cargo-cas hit");
         Some(CacheEntry { root, manifest })
     }
@@ -315,6 +405,7 @@ impl CacheAction {
                 )
             })
             .collect::<Vec<_>>();
+        let stats = self.stats.clone();
 
         Work::new(move |state| {
             let mut restored_rmeta = false;
@@ -341,6 +432,7 @@ impl CacheAction {
                 }
                 Err(error) => {
                     warn!(error = ?error, "cargo-cas entry disappeared during restore; compiling normally");
+                    stats.eligible_rustc();
                     normal_work.call(state)
                 }
             }
@@ -355,13 +447,16 @@ impl CacheAction {
             Ok(_lock) => {
                 if allow_hit {
                     if let Some(entry) = self.lookup() {
+                        self.stats.duplicate_build_avoidance();
                         return self.restore_or_compile(entry, normal_work).call(state);
                     }
                 }
+                self.stats.eligible_rustc();
                 normal_work.call(state)
             }
             Err(error) => {
                 warn!(error = ?error, key = self.key.as_str(), "cargo-cas key lock unavailable; compiling normally");
+                self.stats.eligible_rustc();
                 normal_work.call(state)
             }
         })

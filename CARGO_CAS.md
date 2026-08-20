@@ -610,6 +610,16 @@ If artifacts are not relocatable, record the exact rustc/Cargo path input that
 requires remapping or exclusion. Do not paper over it by copying arbitrary
 workspace metadata into the global entry.
 
+## Cache observability
+
+`CARGO_LOG=cargo::compiler::cas=debug` exposes per-action `hit`, `miss`,
+`reject`, and `skip` decisions without changing Cargo's ordinary output. At
+the successful end of a cache-enabled invocation it also emits a structured
+`cargo-cas summary`: eligible units, hits, misses, rejects, eligible `rustc`
+work, same-key duplicate-build avoidance, and a reason-counted skip map. The
+summary is process-local observability, not mutable entry metadata; cache
+entries remain immutable after publication.
+
 ## Exact archaeology commands and checks
 
 The following read-only commands were used for this document:

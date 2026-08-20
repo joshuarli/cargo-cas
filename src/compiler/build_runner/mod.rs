@@ -18,6 +18,7 @@ use itertools::Itertools;
 use jobserver::Client;
 
 use super::RustdocFingerprint;
+use super::cas::CacheStats;
 use super::custom_build::{self, BuildDeps, BuildScriptOutputs, BuildScripts};
 use super::fingerprint::{Checksum, Fingerprint};
 use super::job_queue::JobQueue;
@@ -94,6 +95,11 @@ pub struct BuildRunner<'a, 'gctx> {
 
     /// Manages locks for build units when fine grain locking is enabled.
     pub lock_manager: Arc<LockManager>,
+
+    /// Process-local counters for the experimental immutable artifact cache.
+    /// They are emitted through the cache debug target after the job queue has
+    /// completed, so non-CAS Cargo behavior and ordinary output stay unchanged.
+    pub(crate) cas_stats: CacheStats,
 }
 
 impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
@@ -135,6 +141,7 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
             failed_scrape_units: Arc::new(Mutex::new(HashSet::default())),
             unused_dep_state: UnusedDepState::new(bcx),
             lock_manager: Arc::new(LockManager::new()),
+            cas_stats: CacheStats::default(),
         })
     }
 
@@ -206,6 +213,7 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
 
         // Now that we've figured out everything that we're going to do, do it!
         queue.execute(&mut self)?;
+        self.cas_stats.log_summary();
 
         // Add `OUT_DIR` to env vars if unit has a build script.
         let units_with_build_script = &self

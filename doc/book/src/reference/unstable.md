@@ -1714,6 +1714,11 @@ The log records `cargo-cas hit`, `cargo-cas miss`, `cargo-cas reject`, and
 or cache-infrastructure failure is only a performance cost: Cargo falls back
 to its ordinary compiler work.
 
+Each completed cache-enabled build also records one `cargo-cas summary` event.
+Its structured fields report eligible units, hits, misses, rejects, eligible
+`rustc` work, same-key duplicate-build avoidance, and skip counts grouped by
+reason. This is debug tracing only; it does not change normal Cargo output.
+
 ## open-namespaces
 
 * Tracking Issue: [#13576](https://github.com/rust-lang/cargo/issues/13576)
