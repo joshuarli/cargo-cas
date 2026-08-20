@@ -223,7 +223,8 @@ fn compile<'gctx>(
                     None
                 };
                 let work = if let Some(entry) = cache_entry {
-                    cas::restore_work(build_runner, unit, entry)?
+                    let normal_work = rustc(build_runner, unit, exec)?;
+                    cas::restore_or_compile(build_runner, unit, entry, normal_work)?
                 } else if unit.mode.is_doc() || unit.mode.is_doc_scrape() {
                     rustdoc(build_runner, unit)?
                 } else {

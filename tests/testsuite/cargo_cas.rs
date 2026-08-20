@@ -1,6 +1,7 @@
 //! macOS-only acceptance tests for the experimental `-Zcargo-cas` cache.
 
 use std::fs;
+use std::os::unix::fs::symlink;
 use std::path::Path;
 
 use crate::prelude::*;
@@ -274,5 +275,168 @@ edition = "2024"
         !crate_was_compiled(&normal_output, "cas_build_second"),
         "the normal final artifact should remain fresh after a cache hit:\n{}",
         String::from_utf8_lossy(&normal_output.stderr)
+    );
+}
+
+#[cargo_test]
+fn cache_ignores_partial_entries_and_repairs_corrupt_writer_state() {
+    const PACKAGE: &str = "cas-gate-four-dep";
+    const CRATE: &str = "cas_gate_four_dep";
+
+    registry::init();
+    Package::new(PACKAGE, "1.0.0")
+        .edition("2024")
+        .file("src/lib.rs", "pub fn answer() -> u32 { 42 }\n")
+        .publish();
+
+    // This is exactly the state left by a process that dies while staging an
+    // entry.  `tmp` is never considered by lookup, so it cannot become a hit.
+    let cache = paths::cargo_home().join("cache/cargo-cas-v0");
+    let abandoned = cache.join("tmp/crashed-writer/artifacts/0");
+    fs::create_dir_all(abandoned.parent().unwrap()).unwrap();
+    fs::write(&abandoned, b"partial artifact").unwrap();
+
+    let manifest = format!(
+        r#"[package]
+name = "cas-gate-four-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+{PACKAGE} = "1.0.0"
+"#,
+    );
+    let first = project_in("cas-gate-four-first")
+        .file("Cargo.toml", &manifest)
+        .file(
+            "src/main.rs",
+            "fn main() { cas_gate_four_dep::answer(); }\n",
+        )
+        .build();
+    let second = project_in("cas-gate-four-second")
+        .file("Cargo.toml", &manifest)
+        .file(
+            "src/main.rs",
+            "fn main() { cas_gate_four_dep::answer(); }\n",
+        )
+        .build();
+    let third = project_in("cas-gate-four-third")
+        .file("Cargo.toml", &manifest)
+        .file(
+            "src/main.rs",
+            "fn main() { cas_gate_four_dep::answer(); }\n",
+        )
+        .build();
+
+    let first_output = run_check(
+        &first,
+        &paths::root().join("cas-gate-four-first-target"),
+        "",
+    );
+    assert!(crate_was_compiled(&first_output, CRATE));
+    let cache_manifest = cache_manifest();
+    let entry = cache_manifest.parent().unwrap().to_path_buf();
+    assert!(abandoned.is_file());
+
+    // A manifest symlink is not a cache manifest.  In particular, lookup must
+    // not follow it outside the entry, and successful normal work must replace
+    // the invalid entry with a complete immutable one.
+    let outside_manifest = paths::root().join("outside-cargo-cas-manifest");
+    fs::copy(&cache_manifest, &outside_manifest).unwrap();
+    fs::remove_file(&cache_manifest).unwrap();
+    symlink(&outside_manifest, &cache_manifest).unwrap();
+    let symlink_output = run_check(
+        &second,
+        &paths::root().join("cas-gate-four-second-target"),
+        "",
+    );
+    assert!(
+        crate_was_compiled(&symlink_output, CRATE),
+        "a symlinked cache manifest must be rejected:\n{}",
+        String::from_utf8_lossy(&symlink_output.stderr)
+    );
+    assert!(!cache_manifest.is_symlink());
+
+    let repaired_output = run_check(
+        &third,
+        &paths::root().join("cas-gate-four-third-target"),
+        "",
+    );
+    assert!(
+        !crate_was_compiled(&repaired_output, CRATE),
+        "a repaired entry should be reusable:\n{}",
+        String::from_utf8_lossy(&repaired_output.stderr)
+    );
+
+    // A regular artifact whose digest no longer matches the manifest is also
+    // corrupt.  Cargo must reject it, rebuild normally, and make the repaired
+    // immutable entry available to the following workspace.
+    fs::write(entry.join("artifacts/0"), b"corrupt artifact").unwrap();
+    let corrupt = project_in("cas-gate-four-corrupt")
+        .file("Cargo.toml", &manifest)
+        .file(
+            "src/main.rs",
+            "fn main() { cas_gate_four_dep::answer(); }\n",
+        )
+        .build();
+    let digest_repaired = project_in("cas-gate-four-digest-repaired")
+        .file("Cargo.toml", &manifest)
+        .file(
+            "src/main.rs",
+            "fn main() { cas_gate_four_dep::answer(); }\n",
+        )
+        .build();
+    let corrupt_output = run_check(
+        &corrupt,
+        &paths::root().join("cas-gate-four-corrupt-target"),
+        "",
+    );
+    assert!(crate_was_compiled(&corrupt_output, CRATE));
+    let digest_repaired_output = run_check(
+        &digest_repaired,
+        &paths::root().join("cas-gate-four-digest-repaired-target"),
+        "",
+    );
+    assert!(
+        !crate_was_compiled(&digest_repaired_output, CRATE),
+        "a digest-repaired entry should be reusable:\n{}",
+        String::from_utf8_lossy(&digest_repaired_output.stderr)
+    );
+
+    // Simulate a crash after a final directory is created but before a
+    // manifest is published.  It is not a hit and the following normal build
+    // repairs it; the next workspace then gets a verified hit.
+    fs::remove_dir_all(&entry).unwrap();
+    fs::create_dir_all(entry.join("artifacts")).unwrap();
+    fs::write(entry.join("artifacts/0"), b"partial artifact").unwrap();
+    let partial = project_in("cas-gate-four-partial")
+        .file("Cargo.toml", &manifest)
+        .file(
+            "src/main.rs",
+            "fn main() { cas_gate_four_dep::answer(); }\n",
+        )
+        .build();
+    let recovered = project_in("cas-gate-four-recovered")
+        .file("Cargo.toml", &manifest)
+        .file(
+            "src/main.rs",
+            "fn main() { cas_gate_four_dep::answer(); }\n",
+        )
+        .build();
+    let partial_output = run_check(
+        &partial,
+        &paths::root().join("cas-gate-four-partial-target"),
+        "",
+    );
+    assert!(crate_was_compiled(&partial_output, CRATE));
+    let recovered_output = run_check(
+        &recovered,
+        &paths::root().join("cas-gate-four-recovered-target"),
+        "",
+    );
+    assert!(
+        !crate_was_compiled(&recovered_output, CRATE),
+        "a repaired partial entry should be reusable:\n{}",
+        String::from_utf8_lossy(&recovered_output.stderr)
     );
 }

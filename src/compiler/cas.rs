@@ -6,7 +6,7 @@
 //! module only substitutes the work normally performed by `rustc`.
 
 use std::collections::BTreeSet;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -154,8 +154,11 @@ pub(crate) fn lookup(
         return Ok(None);
     };
     let root = cache_root(build_runner).join(key.as_str());
+    if !is_plain_directory(&root) {
+        return Ok(None);
+    }
     let manifest_path = root.join(MANIFEST_FILE);
-    let Ok(manifest_bytes) = fs::read(&manifest_path) else {
+    let Ok(manifest_bytes) = read_regular_file(&manifest_path) else {
         return Ok(None);
     };
     let Ok(manifest) = serde_json::from_slice::<CacheManifestV0>(&manifest_bytes) else {
@@ -181,12 +184,17 @@ pub(crate) fn lookup(
 }
 
 /// Returns work that materializes a validated entry at Cargo's usual output
-/// paths.  This leaves `extern_args`, `-L` construction, local fingerprints,
+/// paths. This leaves `extern_args`, `-L` construction, local fingerprints,
 /// and final artifact uplift unchanged.
-pub(crate) fn restore_work(
+///
+/// A hit can still disappear or become unreadable between lookup and the
+/// actual job. That is cache-infrastructure damage, so recover by running the
+/// already-prepared normal compiler work instead of failing Cargo.
+pub(crate) fn restore_or_compile(
     build_runner: &BuildRunner<'_, '_>,
     unit: &Unit,
     entry: CacheEntry,
+    normal_work: Work,
 ) -> CargoResult<Work> {
     let expected = artifact_paths(build_runner, unit)?;
     debug_assert!(manifest_matches_expected(&entry.manifest, &expected));
@@ -207,21 +215,32 @@ pub(crate) fn restore_work(
 
     Ok(Work::new(move |state| {
         let mut restored_rmeta = false;
-        for (source, destination, role) in restores {
-            let parent = destination.parent().expect("Cargo output path has parent");
-            paths::create_dir_all(parent)?;
-            // Cache entries are immutable.  Copy rather than hardlink so a
-            // later local output cleanup or compiler invocation can never
-            // mutate a globally cached inode.
-            fs::copy(source, destination)?;
-            if role == ArtifactRole::Rmeta {
-                restored_rmeta = true;
+        let restored: CargoResult<()> = (|| {
+            for (source, destination, role) in restores {
+                let parent = destination.parent().expect("Cargo output path has parent");
+                paths::create_dir_all(parent)?;
+                // Cache entries are immutable. Copy rather than hardlink so a
+                // later local output cleanup or compiler invocation can never
+                // mutate a globally cached inode.
+                fs::copy(source, destination)?;
+                if role == ArtifactRole::Rmeta {
+                    restored_rmeta = true;
+                }
+            }
+            Ok(())
+        })();
+        match restored {
+            Ok(()) => {
+                if restored_rmeta {
+                    state.rmeta_produced();
+                }
+                Ok(())
+            }
+            Err(error) => {
+                warn!(error = ?error, "cargo-cas entry disappeared during restore; compiling normally");
+                normal_work.call(state)
             }
         }
-        if restored_rmeta {
-            state.rmeta_produced();
-        }
-        Ok(())
     }))
 }
 
@@ -286,8 +305,16 @@ impl CachePublication {
         }
 
         let final_entry = self.cache.join(self.key.as_str());
-        if final_entry.exists() {
-            return Ok(());
+        if fs::symlink_metadata(&final_entry).is_ok() {
+            if entry_is_valid(&final_entry, &self.key, &self.artifacts) {
+                return Ok(());
+            }
+            // A process that died before publication cannot leave a final
+            // entry because publication is a rename.  Still, an interrupted
+            // older implementation or local corruption can leave one behind.
+            // Do not preserve an entry that will never become a hit.
+            warn!(path = %final_entry.display(), "discarding invalid cargo-cas cache entry before republishing");
+            remove_entry(&final_entry)?;
         }
 
         let temporary_entry = self.cache.join("tmp").join(format!(
@@ -324,6 +351,10 @@ impl CachePublication {
             temporary_entry.join(MANIFEST_FILE),
             serde_json::to_vec(&manifest)?,
         )?;
+        if !entry_is_valid(&temporary_entry, &self.key, &self.artifacts) {
+            let _ = fs::remove_dir_all(&temporary_entry);
+            return Err(io::Error::other("staged cargo-cas entry failed validation").into());
+        }
 
         // `tmp` and the final entry are both below the same cache root, so rename
         // makes a completed entry visible atomically.  If another writer won the
@@ -512,19 +543,82 @@ fn cache_root(build_runner: &BuildRunner<'_, '_>) -> PathBuf {
 }
 
 fn validate_manifest(root: &Path, manifest: &CacheManifestV0) -> bool {
+    if !is_plain_directory(root) || !is_plain_directory(&root.join(ARTIFACTS_DIRECTORY)) {
+        return false;
+    }
     let mut files = BTreeSet::new();
     manifest.artifacts.iter().all(|artifact| {
         if !is_safe_file_name(&artifact.file) || !files.insert(&artifact.file) {
             return false;
         }
         let path = root.join(ARTIFACTS_DIRECTORY).join(&artifact.file);
-        let Ok(metadata) = fs::metadata(&path) else {
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
             return false;
         };
         metadata.is_file()
             && metadata.len() == artifact.size
             && digest_file(&path).is_ok_and(|digest| digest == artifact.digest)
     })
+}
+
+/// Checks every entry component before accepting a cache hit.  The manifest
+/// only stores relative artifact names, but a symlink at the entry boundary or
+/// in its artifact set could otherwise redirect Cargo outside its cache root.
+fn entry_is_valid(root: &Path, key: &ActionKey, expected: &[ArtifactPath]) -> bool {
+    if !is_plain_directory(root) {
+        return false;
+    }
+    let manifest_path = root.join(MANIFEST_FILE);
+    let Ok(manifest_bytes) = read_regular_file(&manifest_path) else {
+        return false;
+    };
+    let Ok(manifest) = serde_json::from_slice::<CacheManifestV0>(&manifest_bytes) else {
+        return false;
+    };
+    manifest.format_version == CACHE_FORMAT_VERSION
+        && manifest.action_key == key.as_str()
+        && validate_manifest(root, &manifest)
+        && manifest_matches_expected(&manifest, expected)
+}
+
+fn is_plain_directory(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
+}
+
+fn remove_entry(path: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
+}
+
+fn read_regular_file(path: &Path) -> io::Result<Vec<u8>> {
+    let mut file = open_regular_file(path)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn open_regular_file(path: &Path) -> io::Result<File> {
+    if !fs::symlink_metadata(path)?.file_type().is_file() {
+        return Err(io::Error::other("cargo-cas entry is not a regular file"));
+    }
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(io::Error::other("cargo-cas entry is not a regular file"));
+    }
+    Ok(file)
 }
 
 fn manifest_matches_expected(manifest: &CacheManifestV0, expected: &[ArtifactPath]) -> bool {
@@ -540,7 +634,7 @@ fn manifest_matches_expected(manifest: &CacheManifestV0, expected: &[ArtifactPat
 }
 
 fn digest_file(path: &Path) -> io::Result<String> {
-    let mut file = fs::File::open(path)?;
+    let mut file = open_regular_file(path)?;
     let mut digest = blake3::Hasher::new();
     let mut buffer = [0; 16 * 1024];
     loop {
