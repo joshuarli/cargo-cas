@@ -90,6 +90,25 @@ edition = "2024"
         .build()
 }
 
+fn registry_dependency_project(name: &str, dependency: &str) -> Project {
+    project_in(name)
+        .file(
+            "Cargo.toml",
+            &format!(
+                r#"[package]
+name = "{name}"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+{dependency} = "1.0.0"
+"#,
+            ),
+        )
+        .file("src/main.rs", "fn main() {}\n")
+        .build()
+}
+
 fn cache_manifest() -> std::path::PathBuf {
     let cache = paths::home().join(".cargo/cache/cargo-cas-v1");
     fs::read_dir(&cache)
@@ -389,6 +408,98 @@ edition = "2024"
         crate_was_compiled(&output, "local_dependency"),
         "path sources are ineligible and must run normal rustc:\n{}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cargo_test]
+fn build_script_and_proc_macro_dependency_subgraphs_use_normal_rustc() {
+    const BUILD_SCRIPT_PACKAGE: &str = "cas-build-script-dep";
+    const BUILD_SCRIPT_CRATE: &str = "cas_build_script_dep";
+    const PROC_MACRO_PACKAGE: &str = "cas-proc-macro-dep";
+    const PROC_MACRO_CRATE: &str = "cas_proc_macro_dep";
+    const PROC_MACRO_USER_PACKAGE: &str = "cas-proc-macro-user";
+    const PROC_MACRO_USER_CRATE: &str = "cas_proc_macro_user";
+
+    registry::init();
+    Package::new(BUILD_SCRIPT_PACKAGE, "1.0.0")
+        .edition("2024")
+        .file("build.rs", "fn main() {}\n")
+        .file("src/lib.rs", "pub fn answer() {}\n")
+        .publish();
+    Package::new(PROC_MACRO_PACKAGE, "1.0.0")
+        .edition("2024")
+        .proc_macro(true)
+        .file(
+            "src/lib.rs",
+            r#"extern crate proc_macro;
+use proc_macro::TokenStream;
+
+#[proc_macro]
+pub fn noop(_input: TokenStream) -> TokenStream { TokenStream::new() }
+"#,
+        )
+        .publish();
+    Package::new(PROC_MACRO_USER_PACKAGE, "1.0.0")
+        .edition("2024")
+        .dep(PROC_MACRO_PACKAGE, "1.0.0")
+        .file(
+            "src/lib.rs",
+            "use cas_proc_macro_dep::noop;\nnoop!();\npub fn answer() {}\n",
+        )
+        .publish();
+
+    let build_script_first =
+        registry_dependency_project("cas-build-script-first", BUILD_SCRIPT_PACKAGE);
+    let build_script_second =
+        registry_dependency_project("cas-build-script-second", BUILD_SCRIPT_PACKAGE);
+    let proc_macro_first =
+        registry_dependency_project("cas-proc-macro-first", PROC_MACRO_USER_PACKAGE);
+    let proc_macro_second =
+        registry_dependency_project("cas-proc-macro-second", PROC_MACRO_USER_PACKAGE);
+
+    let build_script_first_output = run_check(
+        &build_script_first,
+        &paths::root().join("cas-build-script-first-target"),
+        "",
+    );
+    assert!(crate_was_compiled(
+        &build_script_first_output,
+        BUILD_SCRIPT_CRATE
+    ));
+    let build_script_second_output = run_check(
+        &build_script_second,
+        &paths::root().join("cas-build-script-second-target"),
+        "",
+    );
+    assert!(
+        crate_was_compiled(&build_script_second_output, BUILD_SCRIPT_CRATE),
+        "a build-script-affected registry package must remain a normal compile:\n{}",
+        String::from_utf8_lossy(&build_script_second_output.stderr)
+    );
+
+    let proc_macro_first_output = run_check(
+        &proc_macro_first,
+        &paths::root().join("cas-proc-macro-first-target"),
+        "",
+    );
+    assert!(crate_was_compiled(
+        &proc_macro_first_output,
+        PROC_MACRO_CRATE
+    ));
+    assert!(crate_was_compiled(
+        &proc_macro_first_output,
+        PROC_MACRO_USER_CRATE
+    ));
+    let proc_macro_second_output = run_check(
+        &proc_macro_second,
+        &paths::root().join("cas-proc-macro-second-target"),
+        "",
+    );
+    assert!(
+        crate_was_compiled(&proc_macro_second_output, PROC_MACRO_CRATE)
+            && crate_was_compiled(&proc_macro_second_output, PROC_MACRO_USER_CRATE),
+        "a proc-macro-affected registry package must remain a normal compile:\n{}",
+        String::from_utf8_lossy(&proc_macro_second_output.stderr)
     );
 }
 
