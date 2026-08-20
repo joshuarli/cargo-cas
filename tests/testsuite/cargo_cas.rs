@@ -87,6 +87,26 @@ fn run_build(project: &Project, target_dir: &Path) -> RawOutput {
     cargo.run()
 }
 
+fn run_build_with_rustc(
+    project: &Project,
+    target_dir: &Path,
+    rustc: &Path,
+    trigger_crate: &str,
+    log: &Path,
+    release: &Path,
+) -> RawOutput {
+    let mut cargo = project.cargo("build -Zcargo-cas -vv");
+    cargo
+        .arg("--target-dir")
+        .arg(target_dir)
+        .env("RUSTC", rustc)
+        .env("CAS_TRIGGER_CRATE", trigger_crate)
+        .env("CAS_LOG", log)
+        .env("CAS_RELEASE", release)
+        .masquerade_as_nightly_cargo(&["cargo-cas"]);
+    cargo.run()
+}
+
 fn run_normal_build(project: &Project, target_dir: &Path) -> RawOutput {
     let mut cargo = project.cargo("build -vv");
     cargo.arg("--target-dir").arg(target_dir);
@@ -266,6 +286,33 @@ fn start_check_paused_before_cas_publish(
         .arg("--target-dir")
         .arg(target_dir)
         .env("CARGO_CAS_TEST_PAUSE_BEFORE_PUBLISH", pause_signal)
+        .masquerade_as_nightly_cargo(&["cargo-cas"]);
+    cargo
+        .build_command()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+fn start_build_paused_after_cas_rmeta(
+    project: &Project,
+    target_dir: &Path,
+    rustc: &Path,
+    trigger_crate: &str,
+    log: &Path,
+    release: &Path,
+    pause_signal: &Path,
+) -> Child {
+    let mut cargo = project.cargo("build -Zcargo-cas -vv");
+    cargo
+        .arg("--target-dir")
+        .arg(target_dir)
+        .env("RUSTC", rustc)
+        .env("CAS_TRIGGER_CRATE", trigger_crate)
+        .env("CAS_LOG", log)
+        .env("CAS_RELEASE", release)
+        .env("CARGO_CAS_TEST_PAUSE_AFTER_RMETA", pause_signal)
         .masquerade_as_nightly_cargo(&["cargo-cas"]);
     cargo
         .build_command()
@@ -1137,6 +1184,106 @@ edition = "2024"
         !crate_was_compiled(&normal_output, "cas_build_second"),
         "the normal final artifact should remain fresh after a cache hit:\n{}",
         String::from_utf8_lossy(&normal_output.stderr)
+    );
+}
+
+#[cargo_test]
+fn cache_hit_releases_pipelined_dependents_after_rmeta_materialization() {
+    const PACKAGE: &str = "cas-pipeline-dep";
+    const CRATE: &str = "cas_pipeline_dep";
+    const ROOT_CRATE: &str = "cas_pipeline_second";
+
+    registry::init();
+    Package::new(PACKAGE, "1.0.0")
+        .edition("2024")
+        .file("src/lib.rs", "pub fn answer() -> u32 { 42 }\n")
+        .publish();
+
+    let manifest = format!(
+        r#"[package]
+name = "cas-pipeline-second"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+{PACKAGE} = "1.0.0"
+"#,
+    );
+    let first = project_in("cas-pipeline-first")
+        .file("Cargo.toml", &manifest)
+        .file(
+            "src/lib.rs",
+            "pub fn answer() -> u32 { cas_pipeline_dep::answer() }\n",
+        )
+        .file(
+            "src/main.rs",
+            "fn main() { println!(\"{}\", cas_pipeline_second::answer()); }\n",
+        )
+        .build();
+    let second = project_in("cas-pipeline-second")
+        .file("Cargo.toml", &manifest)
+        .file(
+            "src/lib.rs",
+            "pub fn answer() -> u32 { cas_pipeline_dep::answer() + 1 }\n",
+        )
+        .file(
+            "src/main.rs",
+            "fn main() { println!(\"{}\", cas_pipeline_second::answer()); }\n",
+        )
+        .build();
+
+    // The cache key includes the canonical RUSTC executable, so populate and
+    // consume the entry with the same transparent proxy.  The release file
+    // exists from the start; it makes this proxy an observer, not a source of
+    // artificial scheduling delay.
+    let rustc = gated_rustc("cas-pipeline-rustc");
+    let log = paths::root().join("cas-pipeline-rustc.log");
+    let release = paths::root().join("cas-pipeline-rustc.release");
+    fs::write(&release, "observe only").unwrap();
+    let first_output = run_build_with_rustc(
+        &first,
+        &paths::root().join("cas-pipeline-first-target"),
+        &rustc,
+        ROOT_CRATE,
+        &log,
+        &release,
+    );
+    assert!(crate_was_compiled(&first_output, CRATE));
+    assert!(cache_manifest().is_file());
+    fs::remove_file(&log).unwrap_or(());
+
+    let pause_signal = paths::root().join("cas-pipeline-rmeta-ready");
+    let child = start_build_paused_after_cas_rmeta(
+        &second,
+        &paths::root().join("cas-pipeline-second-target"),
+        &rustc,
+        ROOT_CRATE,
+        &log,
+        &release,
+        &pause_signal,
+    );
+    let rmeta_ready = wait_for_path(&pause_signal);
+    let dependent_started = rmeta_ready && wait_for_log_line(&log, ROOT_CRATE);
+    // Always release the child before asserting. A failed scheduler
+    // regression must fail the test without leaking a paused Cargo process
+    // into the rest of the test suite.
+    if pause_signal.exists() {
+        fs::remove_file(&pause_signal).unwrap();
+    }
+    let output = wait_for_child(child);
+    assert!(
+        rmeta_ready,
+        "the cache hit did not reach its rmeta-ready boundary"
+    );
+    assert!(
+        dependent_started,
+        "the dependent rustc did not start while cache transport was paused"
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains(&format!("--crate-name {CRATE}")),
+        "the cached dependency must not run rustc:\n{}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

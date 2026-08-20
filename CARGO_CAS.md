@@ -647,8 +647,10 @@ then translated dep-info. `CacheAction::restore_or_compile` copies that
 metadata role first and calls `JobState::rmeta_produced` immediately after it
 is materialized. A metadata-only dependent can therefore use the normal Cargo
 pipeline edge without waiting for linkable-artifact or local-bookkeeping
-transport. The Gate 3 manifest regression asserts this role order alongside
-the normal build/artifact-dir behavior.
+transport. The Gate 3 manifest regression asserts this directly: it pauses a
+cache hit immediately after `.rmeta` transport and observes the dependent
+root's rustc proxy start before linkable/dep-info transport is released. The
+same test also keeps the normal build/artifact-dir behavior covered.
 
 ## Exact archaeology commands and checks
 

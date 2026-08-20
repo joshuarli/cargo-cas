@@ -441,6 +441,7 @@ impl CacheAction {
                         // manifest always places this role before the
                         // linkable artifact and dep-info transport files.
                         state.rmeta_produced();
+                        pause_after_rmeta_for_test();
                     }
                 }
                 Ok(())
@@ -648,6 +649,24 @@ impl CachePublication {
 /// cache files.
 fn pause_before_publish_for_test() {
     let Some(signal_path) = std::env::var_os("CARGO_CAS_TEST_PAUSE_BEFORE_PUBLISH") else {
+        return;
+    };
+    let signal_path = PathBuf::from(signal_path);
+    if fs::write(&signal_path, std::process::id().to_string()).is_err() {
+        return;
+    }
+    while signal_path.exists() {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Provides an integration-test-only boundary after a cache hit has made its
+/// metadata artifact available to Cargo's normal scheduler.  The pipelining
+/// regression keeps this boundary closed until a dependent's rustc proxy has
+/// started, proving that `rmeta_produced` is not deferred behind linkable or
+/// dep-info materialization.
+fn pause_after_rmeta_for_test() {
+    let Some(signal_path) = std::env::var_os("CARGO_CAS_TEST_PAUSE_AFTER_RMETA") else {
         return;
     };
     let signal_path = PathBuf::from(signal_path);
