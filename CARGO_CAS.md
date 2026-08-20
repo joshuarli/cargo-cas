@@ -575,6 +575,22 @@ unchanged version banner while changing code generation, and a sysroot can
 provide compilation inputs not represented in that banner. The corresponding
 regression test uses two such shims and requires a cache miss.
 
+## Gate 1 observed relocation contract
+
+`tests/testsuite/gate1_relocatability.rs` compiles the same local-registry
+library independently in two unrelated macOS workspaces. For matching source,
+features, profile, target, and toolchain, its `.rmeta`, `.rlib`, and every
+extracted `.rlib` archive member are byte-identical. This establishes that the
+compiler artifact set is suitable for the controlled V0 reuse experiment.
+
+The same test also establishes the boundary around Cargo's local state:
+translated dep-info and fingerprint files differ and contain each workspace's
+absolute target directory. They are required to make Cargo regard restored
+outputs as fresh, but are not global artifact identity. A cache hit therefore
+restores the immutable compiler artifacts and creates the local Cargo state in
+the destination unit; it does not treat arbitrary workspace bookkeeping as
+globally portable.
+
 ## Cache format V1
 
 The current experiment stores entries under
