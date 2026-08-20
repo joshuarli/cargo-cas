@@ -3,7 +3,7 @@
 use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::Path;
-use std::process::{Child, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -45,6 +45,35 @@ fn run_check_with_rustc(project: &Project, target_dir: &Path, rustc: &Path) -> R
         .arg("--target-dir")
         .arg(target_dir)
         .env("RUSTC", rustc)
+        .masquerade_as_nightly_cargo(&["cargo-cas"]);
+    cargo.run()
+}
+
+fn run_check_with_config(project: &Project, target_dir: &Path, config: &str) -> RawOutput {
+    let mut cargo = project.cargo("check -Zcargo-cas -vv");
+    cargo
+        .arg("--target-dir")
+        .arg(target_dir)
+        .arg("--config")
+        .arg(config)
+        .masquerade_as_nightly_cargo(&["cargo-cas"]);
+    cargo.run()
+}
+
+fn run_check_for_explicit_host_target(project: &Project, target_dir: &Path) -> RawOutput {
+    let rustc_verbose = Command::new("rustc").arg("-vV").output().unwrap();
+    let host = String::from_utf8(rustc_verbose.stdout)
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .expect("rustc -vV includes a host triple")
+        .to_owned();
+    let mut cargo = project.cargo("check -Zcargo-cas -vv");
+    cargo
+        .arg("--target-dir")
+        .arg(target_dir)
+        .arg("--target")
+        .arg(host)
         .masquerade_as_nightly_cargo(&["cargo-cas"]);
     cargo.run()
 }
@@ -408,6 +437,106 @@ pub fn answer() -> u32 { 41 }
         crate_was_compiled(&fallback_output, REGISTRY_CRATE),
         "a corrupt cargo-cas entry must fall back to rustc:\n{}",
         String::from_utf8_lossy(&fallback_output.stderr)
+    );
+}
+
+#[cargo_test]
+fn effective_config_profile_and_target_inputs_do_not_reuse_cargo_cas_actions() {
+    const PACKAGE: &str = "cas-key-configuration-dep";
+    const CRATE: &str = "cas_key_configuration_dep";
+
+    registry::init();
+    Package::new(PACKAGE, "1.0.0")
+        .edition("2024")
+        .file(
+            "src/lib.rs",
+            r#"
+#[cfg(cas_config)]
+pub const CONFIG: usize = 1;
+
+#[cfg(cas_encoded)]
+pub const ENCODED: usize = 1;
+
+#[cfg(not(any(cas_config, cas_encoded)))]
+pub const DEFAULT: usize = 1;
+"#,
+        )
+        .publish();
+
+    let manifest = format!(
+        r#"[package]
+name = "configuration-action-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+{PACKAGE} = "1.0.0"
+"#,
+    );
+    let project = project_in("cas-key-configuration")
+        .file("Cargo.toml", &manifest)
+        .file("src/main.rs", "fn main() {}\n")
+        .build();
+
+    let baseline = run_check(
+        &project,
+        &paths::root().join("cas-key-configuration-baseline-target"),
+        "",
+    );
+    assert!(crate_was_compiled(&baseline, CRATE));
+
+    let config = run_check_with_config(
+        &project,
+        &paths::root().join("cas-key-configuration-rustflags-target"),
+        r#"build.rustflags=["--cfg","cas_config"]"#,
+    );
+    assert!(
+        crate_was_compiled(&config, CRATE),
+        "effective build.rustflags from Cargo config must select a distinct action:\n{}",
+        String::from_utf8_lossy(&config.stderr)
+    );
+
+    let mut encoded_command = project.cargo("check -Zcargo-cas -vv");
+    encoded_command
+        .arg("--target-dir")
+        .arg(paths::root().join("cas-key-configuration-encoded-target"))
+        .env("CARGO_ENCODED_RUSTFLAGS", "--cfg\u{1f}cas_encoded")
+        .masquerade_as_nightly_cargo(&["cargo-cas"]);
+    let encoded = encoded_command.run();
+    assert!(
+        crate_was_compiled(&encoded, CRATE),
+        "encoded rustflags must select a distinct action:\n{}",
+        String::from_utf8_lossy(&encoded.stderr)
+    );
+
+    for (label, config) in [
+        ("debug", "profile.dev.debug=0"),
+        ("panic", r#"profile.dev.panic="abort""#),
+        ("codegen", "profile.dev.codegen-units=1"),
+    ] {
+        let output = run_check_with_config(
+            &project,
+            &paths::root().join(format!("cas-key-configuration-{label}-target")),
+            config,
+        );
+        assert!(
+            crate_was_compiled(&output, CRATE),
+            "the `{label}` profile input must select a distinct action:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // V1 shares only host units. Even an explicit request for the compiler's
+    // native target uses Cargo's target compilation role and must fall back to
+    // normal work rather than accidentally sharing a host-role cache entry.
+    let explicit_target = run_check_for_explicit_host_target(
+        &project,
+        &paths::root().join("cas-key-configuration-explicit-target"),
+    );
+    assert!(
+        crate_was_compiled(&explicit_target, CRATE),
+        "an explicit target role is intentionally ineligible in macOS V1:\n{}",
+        String::from_utf8_lossy(&explicit_target.stderr)
     );
 }
 
