@@ -306,3 +306,10 @@ codegen-units = 1
 panic = "abort"
 strip = true
 
+# Linker-focused benchmark profile. Keep optimized code and release artifact handling, but
+# generate independent object files quickly so the native linker—not LLVM's fat-LTO pass—does
+# the expensive final-image work.
+[profile.linker-stress]
+inherits = "release"
+codegen-units = 16
+lto = false
