@@ -2,7 +2,7 @@ PYTHON ?= python3
 CARGO ?= cargo
 PREFIX ?= $(HOME)/.cargo-cas
 BINDIR ?= $(PREFIX)/bin
-CARGO_CAS_BUILD_FLAGS ?= --features all-static,cargo-cas-default
+CARGO_CAS_BUILD_FLAGS ?= --features all-static,cargo-default
 
 .PHONY: demo benchmark-ish path-demo install
 

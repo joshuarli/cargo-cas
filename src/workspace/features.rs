@@ -839,7 +839,7 @@ macro_rules! unstable_cli_options {
                 };
 
                 unstable.build_dir_new_layout = !is_new_build_dir_layout_opt_out();
-                #[cfg(feature = "cargo-cas-default")]
+                #[cfg(feature = "cargo-default")]
                 {
                     // The locally installed cargo-cas binary is a forked
                     // Cargo, so its immutable artifact cache is on by
@@ -873,10 +873,10 @@ macro_rules! unstable_cli_options {
 
             #[test]
             fn cargo_cas_default_matches_build_mode() {
-                #[cfg(feature = "cargo-cas-default")]
+                #[cfg(feature = "cargo-default")]
                 assert!(super::CliUnstable::default().cargo_cas);
 
-                #[cfg(not(feature = "cargo-cas-default"))]
+                #[cfg(not(feature = "cargo-default"))]
                 assert!(!super::CliUnstable::default().cargo_cas);
             }
         }

@@ -17,7 +17,7 @@ runs=${CARGO_CAS_NOOP_RUNS:-5}
 
 if [ ! -x "$cargo_bin" ]; then
     echo "cargo-cas binary not found: $cargo_bin" >&2
-    echo "build it with 'cargo build --release --features cargo-cas-default --bin cargo'" >&2
+    echo "build it with 'cargo build --release --features cargo-default --bin cargo'" >&2
     exit 1
 fi
 

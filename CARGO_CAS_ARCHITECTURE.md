@@ -22,7 +22,7 @@ before documentation-only changes. Future implementation changes must update
 the tests first, then revise this document.
 
 The unstable `-Zcargo-cas` option enables the feature for ordinary Cargo
-builds. The locally installed fork can be built with the `cargo-cas-default`
+builds. The locally installed fork can be built with the `cargo-default`
 feature, which enables the same behavior by default; `-Zcargo-cas` remains
 accepted for compatibility. Without either activation path, normal Cargo
 freshness and compilation are unchanged.
@@ -119,7 +119,7 @@ invocation the receipt is validated while holding Cargo's `target/debug/.cargo-l
 missing, malformed, changed, or ambiguous state falls through to the ordinary
 Cargo path. The receipt is an optimization only: it does not replace Cargo's
 fingerprints, resolution, or diagnostics for unsupported command shapes, and it
-is enabled only by the locally installed `cargo-cas-default` feature. Set
+is enabled only by the locally installed `cargo-default` feature. Set
 `CARGO_CAS_DISABLE_FAST_NOOP=1` to force the ordinary path while diagnosing a
 project. `scripts/benchmark-noop.sh` compares that forced ordinary path with
 receipt hits on a selected package. Platforms without the file-lock primitive
