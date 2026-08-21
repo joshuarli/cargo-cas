@@ -1,4 +1,4 @@
-//! macOS-only acceptance tests for the experimental `-Zcargo-cas` cache.
+//! macOS-only acceptance tests for the always-on cargo-cas cache.
 
 use std::fs;
 use std::os::unix::fs::symlink;
@@ -21,7 +21,7 @@ fn crate_was_compiled(output: &RawOutput, crate_name: &str) -> bool {
 }
 
 fn run_check(project: &Project, target_dir: &Path, extra: &str) -> RawOutput {
-    let mut cargo = project.cargo(&format!("check -Zcargo-cas -vv {extra}"));
+    let mut cargo = project.cargo(&format!("check -vv {extra}"));
     cargo
         .arg("--target-dir")
         .arg(target_dir)
@@ -30,7 +30,7 @@ fn run_check(project: &Project, target_dir: &Path, extra: &str) -> RawOutput {
 }
 
 fn run_check_with_cas_log(project: &Project, target_dir: &Path) -> RawOutput {
-    let mut cargo = project.cargo("check -Zcargo-cas -vv");
+    let mut cargo = project.cargo("check -vv");
     cargo
         .arg("--target-dir")
         .arg(target_dir)
@@ -40,7 +40,7 @@ fn run_check_with_cas_log(project: &Project, target_dir: &Path) -> RawOutput {
 }
 
 fn run_check_with_cas_log_in(project: &Project, cwd: &Path, target_dir: &Path) -> RawOutput {
-    let mut cargo = project.cargo("check -Zcargo-cas -vv");
+    let mut cargo = project.cargo("check -vv");
     cargo
         .cwd(cwd)
         .arg("--target-dir")
@@ -51,7 +51,7 @@ fn run_check_with_cas_log_in(project: &Project, cwd: &Path, target_dir: &Path) -
 }
 
 fn run_check_with_rustc(project: &Project, target_dir: &Path, rustc: &Path) -> RawOutput {
-    let mut cargo = project.cargo("check -Zcargo-cas -vv");
+    let mut cargo = project.cargo("check -vv");
     cargo
         .arg("--target-dir")
         .arg(target_dir)
@@ -61,7 +61,7 @@ fn run_check_with_rustc(project: &Project, target_dir: &Path, rustc: &Path) -> R
 }
 
 fn run_check_with_config(project: &Project, target_dir: &Path, config: &str) -> RawOutput {
-    let mut cargo = project.cargo("check -Zcargo-cas -vv");
+    let mut cargo = project.cargo("check -vv");
     cargo
         .arg("--target-dir")
         .arg(target_dir)
@@ -79,7 +79,7 @@ fn run_check_for_explicit_host_target(project: &Project, target_dir: &Path) -> R
         .find_map(|line| line.strip_prefix("host: "))
         .expect("rustc -vV includes a host triple")
         .to_owned();
-    let mut cargo = project.cargo("check -Zcargo-cas -vv");
+    let mut cargo = project.cargo("check -vv");
     cargo
         .arg("--target-dir")
         .arg(target_dir)
@@ -90,7 +90,7 @@ fn run_check_for_explicit_host_target(project: &Project, target_dir: &Path) -> R
 }
 
 fn run_build(project: &Project, target_dir: &Path) -> RawOutput {
-    let mut cargo = project.cargo("build -Zcargo-cas -vv");
+    let mut cargo = project.cargo("build -vv");
     cargo
         .arg("--target-dir")
         .arg(target_dir)
@@ -106,7 +106,7 @@ fn run_build_with_rustc(
     log: &Path,
     release: &Path,
 ) -> RawOutput {
-    let mut cargo = project.cargo("build -Zcargo-cas -vv");
+    let mut cargo = project.cargo("build -vv");
     cargo
         .arg("--target-dir")
         .arg(target_dir)
@@ -284,7 +284,7 @@ fn start_gated_check(
     // lock. The latter is acquired only inside active work, after Cargo has
     // upgraded its own dirty unit lock, so same-key coordination must not turn
     // unrelated units into a global serialization point.
-    let mut cargo = project.cargo("check -Zcargo-cas -Zfine-grain-locking -vv");
+    let mut cargo = project.cargo("check -Zfine-grain-locking -vv");
     cargo
         .arg("--target-dir")
         .arg(target_dir)
@@ -310,7 +310,7 @@ fn start_gated_check_in_dir(
     log: &Path,
     release: &Path,
 ) -> Child {
-    let mut cargo = driver.cargo("check -Zcargo-cas -Zfine-grain-locking -vv");
+    let mut cargo = driver.cargo("check -Zfine-grain-locking -vv");
     cargo
         .cwd(working_dir)
         .arg("--target-dir")
@@ -334,7 +334,7 @@ fn start_check_paused_before_cas_publish(
     target_dir: &Path,
     pause_signal: &Path,
 ) -> Child {
-    let mut cargo = project.cargo("check -Zcargo-cas -vv");
+    let mut cargo = project.cargo("check -vv");
     cargo
         .arg("--target-dir")
         .arg(target_dir)
@@ -357,7 +357,7 @@ fn start_build_paused_after_cas_rmeta(
     release: &Path,
     pause_signal: &Path,
 ) -> Child {
-    let mut cargo = project.cargo("build -Zcargo-cas -vv");
+    let mut cargo = project.cargo("build -vv");
     cargo
         .arg("--target-dir")
         .arg(target_dir)
@@ -616,7 +616,7 @@ pub fn answer() -> u32 { 41 }
         String::from_utf8_lossy(&profile_output.stderr)
     );
 
-    let mut flag_command = flags.cargo("check -Zcargo-cas -vv");
+    let mut flag_command = flags.cargo("check -vv");
     flag_command
         .arg("--target-dir")
         .arg(paths::root().join("cas-flags-target"))
@@ -718,7 +718,7 @@ edition = "2024"
         String::from_utf8_lossy(&config.stderr)
     );
 
-    let mut encoded_command = project.cargo("check -Zcargo-cas -vv");
+    let mut encoded_command = project.cargo("check -vv");
     encoded_command
         .arg("--target-dir")
         .arg(paths::root().join("cas-key-configuration-encoded-target"))
@@ -757,7 +757,7 @@ edition = "2024"
     // source, profile, or RUSTFLAGS. It must still not reuse an entry made
     // without `-Zcargo-lints`: an ActionKey represents the compiler action,
     // not merely the emitted rmeta bytes in this particular fixture.
-    let mut cargo_lints = project.cargo("check -Zcargo-cas -Zcargo-lints -vv");
+    let mut cargo_lints = project.cargo("check -Zcargo-lints -vv");
     cargo_lints
         .arg("--target-dir")
         .arg(paths::root().join("cas-key-configuration-cargo-lints-target"))
@@ -1754,7 +1754,7 @@ edition = "2024"
     // immutable dependency artifacts are restored from cargo-cas.
     let artifact_target = paths::root().join("cas-build-artifact-dir-target");
     let artifact_dir = paths::root().join("cas-build-artifact-dir-export");
-    let mut artifact_command = second.cargo("build -Zcargo-cas -Zunstable-options -vv");
+    let mut artifact_command = second.cargo("build -Zunstable-options -vv");
     artifact_command
         .arg("--target-dir")
         .arg(&artifact_target)

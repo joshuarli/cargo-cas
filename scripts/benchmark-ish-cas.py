@@ -4,7 +4,7 @@
 The benchmark uses the current ``~/d/pi-agent-core-rs`` revision, a private Cargo home
 whose registry is read-only through a symlink, and one target directory inside
 each temporary Git worktree.  It never invokes upstream Cargo: every build is
-run with ``cargo test -Zcargo-cas --workspace --all-targets --all-features
+run with ``cargo test --workspace --all-targets --all-features
 --no-run --profile dev``.  This compiles every workspace package, test,
 example, and dev dependency without executing tests.  A single seed build
 populates the shared immutable cache; the four worktrees then restore from that
@@ -450,7 +450,6 @@ def cargo_command(cargo: Path, target: Path) -> list[str]:
     return [
         str(cargo),
         "test",
-        "-Zcargo-cas",
         "--workspace",
         "--all-targets",
         "--all-features",
@@ -1218,7 +1217,6 @@ def main() -> int:
             "build_mode": "debug",
             "build_command": [
                 "test",
-                "-Zcargo-cas",
                 "--workspace",
                 "--all-targets",
                 "--all-features",

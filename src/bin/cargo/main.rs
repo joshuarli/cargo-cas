@@ -11,13 +11,11 @@ use std::path::{Path, PathBuf};
 
 mod cli;
 mod commands;
-#[cfg(feature = "cargo-default")]
 mod fast_path;
 
 use crate::command_prelude::*;
 
 fn main() {
-    #[cfg(feature = "cargo-default")]
     if fast_path::try_noop() {
         return;
     }
@@ -60,7 +58,6 @@ fn main() {
         cli::main(&mut gctx)
     };
 
-    #[cfg(feature = "cargo-default")]
     if result.is_ok() {
         fast_path::record_success();
     }

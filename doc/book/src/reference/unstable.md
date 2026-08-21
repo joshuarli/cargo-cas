@@ -1691,12 +1691,11 @@ cargo clean gc -Zgc --max-git-size=0 --max-download-size=100MB
 
 ## cargo-cas
 
-The `-Zcargo-cas` flag enables the experimental, macOS-only immutable
-compiled-artifact cache. Cargo may reuse a verified dependency compilation
-from `$CARGO_HOME/cache/cargo-cas-v1` when its complete semantic action key
-matches. Without this flag, Cargo's normal compilation and freshness behavior
-is unchanged when built without the fork's default feature; the locally
-installed fork may enable the feature by default.
+This fork enables the experimental, macOS-only immutable compiled-artifact
+cache unconditionally; there is no activation flag. Cargo may reuse a verified
+dependency compilation from `$CARGO_HOME/cache/cargo-cas-v1` when its complete
+semantic action key matches. For any unit the cache does not cover, Cargo's
+normal compilation and freshness behavior is unchanged.
 
 The cache considers only a conservative closed-world subset: host `lib`/`rlib`
 units from immutable registry or resolved Git sources, complete local source
@@ -1712,7 +1711,7 @@ To inspect decisions without changing normal Cargo output, enable debug
 tracing:
 
 ```sh
-CARGO_LOG=cargo::compiler::cas=debug cargo check -Zcargo-cas
+CARGO_LOG=cargo::compiler::cas=debug cargo check
 ```
 
 The log records `cargo-cas hit`, `cargo-cas miss`, `cargo-cas reject`, and

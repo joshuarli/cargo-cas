@@ -32,8 +32,8 @@ be treated as an available capability.
 
 - Compare the fork-local scheduler/materialization seams with current upstream
   Cargo as the build-dir and locking designs evolve.
-- Separate stable upstream contracts from the experimental `-Zcargo-cas`
-  storage and activation policy.
+- Separate stable upstream contracts from the fork-local cargo-cas
+  storage policy.
 - Add format migration tooling only if retaining old entries becomes useful;
   current format changes intentionally produce safe misses.
 

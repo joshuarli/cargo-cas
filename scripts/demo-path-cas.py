@@ -164,9 +164,9 @@ def run_build(
     }
 
 
-def make_env(cargo_home: Path, rustc: Path, rustdoc: Path, *, cargo_cas: bool, trace: bool) -> dict[str, str]:
+def make_env(cargo_home: Path, rustc: Path, rustdoc: Path, *, trace: bool) -> dict[str, str]:
     env = os.environ.copy()
-    if trace and cargo_cas:
+    if trace:
         env["CARGO_LOG"] = "cargo::compiler::cas=debug"
     else:
         env.pop("CARGO_LOG", None)
@@ -210,7 +210,6 @@ def run_sequence(
     name: str,
     root: Path,
     cargo: Path,
-    cargo_cas: bool,
     epsh: Path,
     ish: Path,
     rustc: Path,
@@ -225,7 +224,7 @@ def run_sequence(
 ]:
     root.mkdir(parents=True)
     home = prepare_home(root, global_registry)
-    env = make_env(home, rustc, rustdoc, cargo_cas=cargo_cas, trace=trace)
+    env = make_env(home, rustc, rustdoc, trace=trace)
     logs = root / "logs"
     logs.mkdir()
     epsh_target = root / "epsh-target"
@@ -233,8 +232,6 @@ def run_sequence(
     cache_root = home / "cache" / "cargo-cas-v1"
 
     epsh_command = [str(cargo), "build"]
-    if cargo_cas:
-        epsh_command.append("-Zcargo-cas")
     epsh_command.extend(profile_args())
     epsh_command.extend(
         [
@@ -263,8 +260,6 @@ def run_sequence(
     lock_path = lock_dir / "Cargo.lock"
     shutil.copy2(ish / "Cargo.lock", lock_path)
     ish_command = [str(cargo), "build"]
-    if cargo_cas:
-        ish_command.append("-Zcargo-cas")
     ish_command.extend(
         [
             "--manifest-path",
@@ -355,7 +350,6 @@ def main() -> int:
             name="regular",
             root=temp_root / "regular",
             cargo=regular_cargo,
-            cargo_cas=False,
             epsh=epsh,
             ish=ish,
             rustc=rustc,
@@ -367,7 +361,6 @@ def main() -> int:
             name="cargo-cas",
             root=temp_root / "cargo-cas",
             cargo=cargo_cas,
-            cargo_cas=True,
             epsh=epsh,
             ish=ish,
             rustc=rustc,

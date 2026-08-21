@@ -287,9 +287,6 @@ doc = false
 
 [features]
 default = ["http-transport-curl"]
-# Use cargo-cas by default in the locally installed fork; ordinary Cargo builds
-# leave the experimental cache behind the existing `-Zcargo-cas` opt-in.
-cargo-default = []
 vendored-openssl = ["openssl/vendored"]
 vendored-libgit2 = ["libgit2-sys/vendored"]
 # This is primarily used by rust-lang/rust distributing cargo the executable.

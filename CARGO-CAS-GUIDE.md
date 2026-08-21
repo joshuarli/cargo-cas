@@ -51,10 +51,10 @@ every checkout.
 
 ## Build and benchmark
 
-Use the pinned toolchain from the repository and opt in explicitly:
+Use the pinned toolchain from the repository:
 
 ```sh
-cargo build -Zcargo-cas --locked
+cargo build --locked
 ```
 
 For an apples-to-apples measurement, use fresh target directories and an

@@ -91,8 +91,8 @@ prefix, for example:
 export PATH="$HOME/.cargo-cas/bin:$(brew --prefix rustup)/bin:$HOME/.cargo/bin:$PATH"
 ```
 
-The installed binary enables the cargo-cas cache by default; `-Zcargo-cas` is
-still accepted for compatibility. Select the rustup toolchain with
+The installed binary enables the cargo-cas cache by default. Select the
+rustup toolchain with
 `RUSTUP_TOOLCHAIN=...` or a project override; a locally shadowed Cargo binary
 no longer receives rustup's `cargo +toolchain` proxy syntax.
 

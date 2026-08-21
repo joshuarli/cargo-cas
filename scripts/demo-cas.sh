@@ -1,7 +1,7 @@
 #!/bin/sh
 # Demonstrates the experimental macOS-only cargo-cas workflow without network
 # access. Build this checkout first (`cargo build`) or set CARGO_CAS_BIN to the
-# Cargo binary that contains the `-Zcargo-cas` experiment.
+# Cargo binary that contains the cargo-cas experiment.
 set -eu
 
 if [ "$(uname -s)" != "Darwin" ]; then
@@ -127,7 +127,7 @@ run_check() {
     log=$3
     (
         cd "$workspace"
-        RUSTC="$rustc_proxy" "$cargo_bin" check -Zcargo-cas -vv --target-dir "$target_dir"
+        RUSTC="$rustc_proxy" "$cargo_bin" check -vv --target-dir "$target_dir"
     ) >"$log" 2>&1
 }
 
@@ -212,7 +212,7 @@ for index in 1 2 3 4 5 6 7 8; do
     printf 'fn main() { println!("agent %s: {}", cas_demo_dep::answer()); }\n' "$index" >"$worktree/src/main.rs"
     (
         cd "$worktree"
-        RUSTC="$rustc_proxy" "$cargo_bin" check -Zcargo-cas -vv \
+        RUSTC="$rustc_proxy" "$cargo_bin" check -vv \
             --target-dir "$work_root/worktree-target-$index"
     ) >"$work_root/worktree-$index.log" 2>&1 &
     pids="$pids $!"

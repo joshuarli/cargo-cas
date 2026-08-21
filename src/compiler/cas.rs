@@ -1281,7 +1281,6 @@ fn build_script_is_representable(
     unit: &Unit,
 ) -> bool {
     if !cfg!(target_os = "macos")
-        || !build_runner.bcx.gctx.cli_unstable().cargo_cas
         || !unit.mode.is_run_custom_build()
         || !unit.kind.is_host()
         || unit.pkg.manifest().links().is_some()
@@ -1603,9 +1602,6 @@ fn ineligibility_reason(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> Opti
     let source_id = unit.pkg.package_id().source_id();
     if !cfg!(target_os = "macos") {
         return Some("unsupported platform");
-    }
-    if !build_runner.bcx.gctx.cli_unstable().cargo_cas {
-        return Some("-Zcargo-cas is not enabled");
     }
     if !source_id.is_path() && !source_id.is_registry() && !source_id.is_git() {
         return Some("source is not an immutable registry or git source");

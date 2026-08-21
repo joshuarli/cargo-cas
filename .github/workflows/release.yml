@@ -46,7 +46,7 @@ jobs:
         run: >-
           cargo build --locked --release -p cargo
           --target "${{ matrix.target }}"
-          --features all-static,cargo-default
+          --features all-static
 
       - name: Package binary
         run: cp "target/${{ matrix.target }}/release/cargo" "cargo-${{ matrix.target }}"

@@ -150,7 +150,7 @@ run_check() {
         (
             cd "$workspace"
             CARGO_HOME="$cargo_home" RUSTC="$rustc_proxy" CAS_BENCHMARK_LABEL="$label" \
-                "$cargo_bin" check -Zcargo-cas -vv --target-dir "$target_dir"
+                "$cargo_bin" check -vv --target-dir "$target_dir"
         ) >"$work_root/$label.log" 2>&1
     else
         (
@@ -219,7 +219,7 @@ run_concurrent() {
             cd "$worktree"
             if [ "$mode" = cas ]; then
                 CARGO_HOME="$cargo_home" RUSTC="$rustc_proxy" CAS_BENCHMARK_LABEL="$label" \
-                    "$cargo_bin" check -Zcargo-cas -vv --target-dir "$work_root/$label-target-$index"
+                    "$cargo_bin" check -vv --target-dir "$work_root/$label-target-$index"
             else
                 CARGO_HOME="$cargo_home" RUSTC="$rustc_proxy" CAS_BENCHMARK_LABEL="$label" \
                     "$cargo_bin" check -vv --target-dir "$work_root/$label-target-$index"
@@ -309,7 +309,7 @@ scaling_started=$(date +%s)
         CAS_BENCHMARK_RECORD_SCALE_ARGS=1 CAS_BENCHMARK_SCALE_ARGS_FILE="$scaling_args" \
         CAS_BENCHMARK_SCALE_DYLIB_PATH_FILE="$scaling_dylib_path" \
         CAS_BENCHMARK_SCALE_PATH_FILE="$scaling_path" \
-        "$cas_bin" check -Zcargo-cas -vv -j "$scaling_jobs" --target-dir "$scaling_target"
+        "$cas_bin" check -vv -j "$scaling_jobs" --target-dir "$scaling_target"
 ) >"$work_root/cas-scaling.log" 2>&1 &
 scaling_pid=$!
 scaling_deadline=$(( $(date +%s) + 60 ))
