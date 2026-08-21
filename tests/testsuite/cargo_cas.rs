@@ -24,8 +24,7 @@ fn run_check(project: &Project, target_dir: &Path, extra: &str) -> RawOutput {
     let mut cargo = project.cargo(&format!("check -vv {extra}"));
     cargo
         .arg("--target-dir")
-        .arg(target_dir)
-        .masquerade_as_nightly_cargo(&["cargo-cas"]);
+        .arg(target_dir);
     cargo.run()
 }
 
@@ -34,8 +33,7 @@ fn run_check_with_cas_log(project: &Project, target_dir: &Path) -> RawOutput {
     cargo
         .arg("--target-dir")
         .arg(target_dir)
-        .env("CARGO_LOG", "cargo::compiler::cas=debug")
-        .masquerade_as_nightly_cargo(&["cargo-cas"]);
+        .env("CARGO_LOG", "cargo::compiler::cas=debug");
     cargo.run()
 }
 
@@ -45,8 +43,7 @@ fn run_check_with_cas_log_in(project: &Project, cwd: &Path, target_dir: &Path) -
         .cwd(cwd)
         .arg("--target-dir")
         .arg(target_dir)
-        .env("CARGO_LOG", "cargo::compiler::cas=debug")
-        .masquerade_as_nightly_cargo(&["cargo-cas"]);
+        .env("CARGO_LOG", "cargo::compiler::cas=debug");
     cargo.run()
 }
 
@@ -55,8 +52,7 @@ fn run_check_with_rustc(project: &Project, target_dir: &Path, rustc: &Path) -> R
     cargo
         .arg("--target-dir")
         .arg(target_dir)
-        .env("RUSTC", rustc)
-        .masquerade_as_nightly_cargo(&["cargo-cas"]);
+        .env("RUSTC", rustc);
     cargo.run()
 }
 
@@ -66,8 +62,7 @@ fn run_check_with_config(project: &Project, target_dir: &Path, config: &str) -> 
         .arg("--target-dir")
         .arg(target_dir)
         .arg("--config")
-        .arg(config)
-        .masquerade_as_nightly_cargo(&["cargo-cas"]);
+        .arg(config);
     cargo.run()
 }
 
@@ -84,8 +79,7 @@ fn run_check_for_explicit_host_target(project: &Project, target_dir: &Path) -> R
         .arg("--target-dir")
         .arg(target_dir)
         .arg("--target")
-        .arg(host)
-        .masquerade_as_nightly_cargo(&["cargo-cas"]);
+        .arg(host);
     cargo.run()
 }
 
@@ -93,8 +87,7 @@ fn run_build(project: &Project, target_dir: &Path) -> RawOutput {
     let mut cargo = project.cargo("build -vv");
     cargo
         .arg("--target-dir")
-        .arg(target_dir)
-        .masquerade_as_nightly_cargo(&["cargo-cas"]);
+        .arg(target_dir);
     cargo.run()
 }
 
@@ -113,14 +106,7 @@ fn run_build_with_rustc(
         .env("RUSTC", rustc)
         .env("CAS_TRIGGER_CRATE", trigger_crate)
         .env("CAS_LOG", log)
-        .env("CAS_RELEASE", release)
-        .masquerade_as_nightly_cargo(&["cargo-cas"]);
-    cargo.run()
-}
-
-fn run_normal_build(project: &Project, target_dir: &Path) -> RawOutput {
-    let mut cargo = project.cargo("build -vv");
-    cargo.arg("--target-dir").arg(target_dir);
+        .env("CAS_RELEASE", release);
     cargo.run()
 }
 
@@ -292,7 +278,7 @@ fn start_gated_check(
         .env("CAS_TRIGGER_CRATE", trigger_crate)
         .env("CAS_LOG", log)
         .env("CAS_RELEASE", release)
-        .masquerade_as_nightly_cargo(&["cargo-cas", "fine-grain-locking"]);
+        .masquerade_as_nightly_cargo(&["fine-grain-locking"]);
     cargo
         .build_command()
         .stdout(Stdio::piped())
@@ -320,7 +306,7 @@ fn start_gated_check_in_dir(
         .env("CAS_TRIGGER_CRATE", trigger_crate)
         .env("CAS_LOG", log)
         .env("CAS_RELEASE", release)
-        .masquerade_as_nightly_cargo(&["cargo-cas", "fine-grain-locking"]);
+        .masquerade_as_nightly_cargo(&["fine-grain-locking"]);
     cargo
         .build_command()
         .stdout(Stdio::piped())
@@ -338,8 +324,7 @@ fn start_check_paused_before_cas_publish(
     cargo
         .arg("--target-dir")
         .arg(target_dir)
-        .env("CARGO_CAS_TEST_PAUSE_BEFORE_PUBLISH", pause_signal)
-        .masquerade_as_nightly_cargo(&["cargo-cas"]);
+        .env("CARGO_CAS_TEST_PAUSE_BEFORE_PUBLISH", pause_signal);
     cargo
         .build_command()
         .stdout(Stdio::piped())
@@ -365,8 +350,7 @@ fn start_build_paused_after_cas_rmeta(
         .env("CAS_TRIGGER_CRATE", trigger_crate)
         .env("CAS_LOG", log)
         .env("CAS_RELEASE", release)
-        .env("CARGO_CAS_TEST_PAUSE_AFTER_RMETA", pause_signal)
-        .masquerade_as_nightly_cargo(&["cargo-cas"]);
+        .env("CARGO_CAS_TEST_PAUSE_AFTER_RMETA", pause_signal);
     cargo
         .build_command()
         .stdout(Stdio::piped())
@@ -620,8 +604,7 @@ pub fn answer() -> u32 { 41 }
     flag_command
         .arg("--target-dir")
         .arg(paths::root().join("cas-flags-target"))
-        .env("RUSTFLAGS", "-C target-cpu=generic")
-        .masquerade_as_nightly_cargo(&["cargo-cas"]);
+        .env("RUSTFLAGS", "-C target-cpu=generic");
     let flags_output = flag_command.run();
     assert!(
         crate_was_compiled(&flags_output, REGISTRY_CRATE),
@@ -722,8 +705,7 @@ edition = "2024"
     encoded_command
         .arg("--target-dir")
         .arg(paths::root().join("cas-key-configuration-encoded-target"))
-        .env("CARGO_ENCODED_RUSTFLAGS", "--cfg\u{1f}cas_encoded")
-        .masquerade_as_nightly_cargo(&["cargo-cas"]);
+        .env("CARGO_ENCODED_RUSTFLAGS", "--cfg\u{1f}cas_encoded");
     let encoded = encoded_command.run();
     assert!(
         crate_was_compiled(&encoded, CRATE),
@@ -761,7 +743,7 @@ edition = "2024"
     cargo_lints
         .arg("--target-dir")
         .arg(paths::root().join("cas-key-configuration-cargo-lints-target"))
-        .masquerade_as_nightly_cargo(&["cargo-cas", "cargo-lints"]);
+        .masquerade_as_nightly_cargo(&["cargo-lints"]);
     let cargo_lints_output = cargo_lints.run();
     assert!(
         crate_was_compiled(&cargo_lints_output, CRATE),
@@ -1760,7 +1742,7 @@ edition = "2024"
         .arg(&artifact_target)
         .arg("--artifact-dir")
         .arg(&artifact_dir)
-        .masquerade_as_nightly_cargo(&["cargo-cas", "unstable-options"]);
+        .masquerade_as_nightly_cargo(&["unstable-options"]);
     let artifact_output = artifact_command.run();
     assert!(
         !crate_was_compiled(&artifact_output, BUILD_CRATE),
@@ -1785,10 +1767,10 @@ edition = "2024"
     assert_cache_artifacts_share_target(cache_entry, &second_target);
 
     // The materialized artifacts and normal fingerprint state are also usable
-    // by an invocation that does not opt into cargo-cas.  This guards the
-    // scheduler boundary: a cache hit is normal local Cargo state, not a
-    // separate freshness regime.
-    let normal_output = run_normal_build(&second, &second_target);
+    // by any Cargo invocation, including a binary without the cache. This
+    // guards the scheduler boundary: a cache hit is normal local Cargo state,
+    // not a separate freshness regime.
+    let normal_output = run_build(&second, &second_target);
     assert!(
         !crate_was_compiled(&normal_output, BUILD_CRATE),
         "normal Cargo should accept the materialized dependency artifact:\n{}",
@@ -1805,7 +1787,7 @@ edition = "2024"
     // must therefore still accept the target's complete local fingerprint and
     // artifact state after the cache itself is gone.
     fs::remove_dir_all(cache_entry).unwrap();
-    let after_cache_removal = run_normal_build(&second, &second_target);
+    let after_cache_removal = run_build(&second, &second_target);
     assert!(
         !crate_was_compiled(&after_cache_removal, BUILD_CRATE),
         "removing a cache entry must not invalidate a materialized target:\n{}",
