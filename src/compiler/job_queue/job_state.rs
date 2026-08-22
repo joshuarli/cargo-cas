@@ -50,6 +50,12 @@ pub struct JobState<'a, 'gctx> {
     /// sending a double message later on.
     rmeta_required: Cell<bool>,
 
+    /// A cache restore may publish metadata to pipelined dependents before a
+    /// later immutable artifact is found missing. The fallback compiler must
+    /// preserve that already-published metadata until the dependent has had a
+    /// chance to open it.
+    cache_restore_fallback: Cell<bool>,
+
     /// Manages locks for build units when fine grain locking is enabled.
     lock_manager: Arc<LockManager>,
 
@@ -74,6 +80,7 @@ impl<'a, 'gctx> JobState<'a, 'gctx> {
             messages,
             output,
             rmeta_required: Cell::new(rmeta_required),
+            cache_restore_fallback: Cell::new(false),
             lock_manager,
             warning_handling,
             _marker: marker::PhantomData,
@@ -159,6 +166,14 @@ impl<'a, 'gctx> JobState<'a, 'gctx> {
             self.messages
                 .push(Message::Finish(self.id, Artifact::Metadata, Ok(())));
         }
+    }
+
+    pub fn cache_restore_fallback(&self) {
+        self.cache_restore_fallback.set(true);
+    }
+
+    pub fn preserves_cache_restore_rmeta(&self) -> bool {
+        self.cache_restore_fallback.get()
     }
 
     pub fn lock_exclusive(&self, lock: &LockKey) -> CargoResult<()> {

@@ -106,6 +106,31 @@ Use explicit GC to bound the global cache, for example:
 cargo clean gc -Zgc --max-cas-size=20GiB
 ```
 
+## End-of-build statistics
+
+Every completed `build`, `check`, or failed compilation emits one
+`cargo-cas summary` event by default. Set `CARGO_LOG=cargo::compiler::cas=debug`
+to include the per-action diagnostics as well. In addition to `eligible`,
+`hits`, `misses`, `rejects`, `eligible_rustc`, `duplicate_build_avoidance`, and
+`skips`, the summary reports the top three miss reasons and logical/allocated
+bytes added and removed from both Cargo's target-owned unit paths and the global
+CAS store (plus signed `*_delta` values). Rejects have their own top-three reason
+list so malformed entries are distinguishable from ordinary absent-entry misses.
+
+Set `CARGO_LOG=off` to disable the summary and all of its additional bookkeeping;
+path snapshots, accounting locks, reason maps, and publication byte metadata
+are then skipped.
+
+These byte values are mutation deltas, not `du`, `df`, or a directory snapshot.
+Target deltas are recorded around each Cargo unit's known output and fingerprint
+paths while Cargo's build/artifact or fine-grained unit lock excludes another
+writer; shared-lock checks use a dedicated target accounting lock. CAS
+publication deltas are committed only by the process whose atomic rename wins;
+hardlink materialization adds target logical bytes but no physical allocation.
+The counters are therefore safe to compare across overlapping Cargo processes:
+a concurrent reader cannot charge the writer's cache entry to its own
+invocation.
+
 The checked-in `scripts/demo-path-cas.py` is the reference fresh-run harness
 for the committed `epsh`/`ish` pair. On the pinned nightly it measured 100.81
 MiB vanilla allocated storage versus 52.85 MiB cargo-cas storage (C = 0.524),

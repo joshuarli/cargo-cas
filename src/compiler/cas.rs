@@ -19,9 +19,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+
 use cargo_util::paths;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::fingerprint;
 use super::job_queue::Work;
@@ -51,11 +54,11 @@ static TEMPORARY_ENTRY_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Per-Cargo-invocation observability for the experimental cache. Counters are
 /// intentionally process-local: they explain one scheduler run without adding
 /// mutable state to immutable cache entries.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct CacheStats(Arc<CacheStatsInner>);
 
-#[derive(Default)]
 struct CacheStatsInner {
+    enabled: bool,
     eligible: AtomicU64,
     hits: AtomicU64,
     misses: AtomicU64,
@@ -63,36 +66,108 @@ struct CacheStatsInner {
     eligible_rustc: AtomicU64,
     duplicate_build_avoidance: AtomicU64,
     skips: Mutex<BTreeMap<&'static str, u64>>,
+    miss_reasons: Mutex<BTreeMap<&'static str, u64>>,
+    reject_reasons: Mutex<BTreeMap<&'static str, u64>>,
+    target_logical_added: AtomicU64,
+    target_logical_removed: AtomicU64,
+    target_allocated_added: AtomicU64,
+    target_allocated_removed: AtomicU64,
+    cache_logical_added: AtomicU64,
+    cache_logical_removed: AtomicU64,
+    cache_allocated_added: AtomicU64,
+    cache_allocated_removed: AtomicU64,
+}
+
+impl Default for CacheStats {
+    fn default() -> Self {
+        Self(Arc::new(CacheStatsInner {
+            enabled: tracing::enabled!(target: "cargo::compiler::cas", tracing::Level::INFO),
+            eligible: AtomicU64::default(),
+            hits: AtomicU64::default(),
+            misses: AtomicU64::default(),
+            rejects: AtomicU64::default(),
+            eligible_rustc: AtomicU64::default(),
+            duplicate_build_avoidance: AtomicU64::default(),
+            skips: Mutex::default(),
+            miss_reasons: Mutex::default(),
+            reject_reasons: Mutex::default(),
+            target_logical_added: AtomicU64::default(),
+            target_logical_removed: AtomicU64::default(),
+            target_allocated_added: AtomicU64::default(),
+            target_allocated_removed: AtomicU64::default(),
+            cache_logical_added: AtomicU64::default(),
+            cache_logical_removed: AtomicU64::default(),
+            cache_allocated_added: AtomicU64::default(),
+            cache_allocated_removed: AtomicU64::default(),
+        }))
+    }
 }
 
 impl CacheStats {
+    pub(crate) fn enabled(&self) -> bool {
+        self.0.enabled
+    }
+
     fn eligible(&self) {
+        if !self.enabled() {
+            return;
+        }
         self.0.eligible.fetch_add(1, Ordering::Relaxed);
     }
 
     fn hit(&self) {
+        if !self.enabled() {
+            return;
+        }
         self.0.hits.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn miss(&self) {
+    fn miss(&self, reason: &'static str) {
+        if !self.enabled() {
+            return;
+        }
         self.0.misses.fetch_add(1, Ordering::Relaxed);
+        let mut reasons = self
+            .0
+            .miss_reasons
+            .lock()
+            .expect("cargo-cas miss counter poisoned");
+        *reasons.entry(reason).or_default() += 1;
     }
 
-    fn reject(&self) {
+    fn reject(&self, reason: &'static str) {
+        if !self.enabled() {
+            return;
+        }
         self.0.rejects.fetch_add(1, Ordering::Relaxed);
+        let mut reasons = self
+            .0
+            .reject_reasons
+            .lock()
+            .expect("cargo-cas reject counter poisoned");
+        *reasons.entry(reason).or_default() += 1;
     }
 
     fn eligible_rustc(&self) {
+        if !self.enabled() {
+            return;
+        }
         self.0.eligible_rustc.fetch_add(1, Ordering::Relaxed);
     }
 
     fn duplicate_build_avoidance(&self) {
+        if !self.enabled() {
+            return;
+        }
         self.0
             .duplicate_build_avoidance
             .fetch_add(1, Ordering::Relaxed);
     }
 
     fn skip(&self, reason: &'static str) {
+        if !self.enabled() {
+            return;
+        }
         let mut skips = self
             .0
             .skips
@@ -101,16 +176,143 @@ impl CacheStats {
         *skips.entry(reason).or_default() += 1;
     }
 
+    fn record_target_transition(&self, before: Option<FileUsage>, after: Option<FileUsage>) {
+        if !self.enabled() {
+            return;
+        }
+        record_transition(
+            before,
+            after,
+            &self.0.target_logical_added,
+            &self.0.target_logical_removed,
+            &self.0.target_allocated_added,
+            &self.0.target_allocated_removed,
+        );
+    }
+
+    fn record_cache_usage(&self, usage: FileUsage, added: bool) {
+        if !self.enabled() {
+            return;
+        }
+        if added {
+            self.0
+                .cache_logical_added
+                .fetch_add(usage.logical, Ordering::Relaxed);
+            self.0
+                .cache_allocated_added
+                .fetch_add(usage.allocated, Ordering::Relaxed);
+        } else {
+            self.0
+                .cache_logical_removed
+                .fetch_add(usage.logical, Ordering::Relaxed);
+            self.0
+                .cache_allocated_removed
+                .fetch_add(usage.allocated, Ordering::Relaxed);
+        }
+    }
+
+    /// Wraps one unit's work in a path-level accounting transaction. Cargo's
+    /// build/artifact lock (or fine-grained unit lock; shared-lock checks use a
+    /// dedicated accounting lock) and the CAS key lock make these paths
+    /// single-writer boundaries. No directory tree or filesystem-wide
+    /// free-space snapshot is needed, so concurrent Cargo invocations cannot
+    /// charge one another's mutations.
+    pub(crate) fn track_target_paths(
+        &self,
+        serialization_lock: Option<PathBuf>,
+        paths: Vec<PathBuf>,
+        work: Work,
+    ) -> Work {
+        if !self.enabled() {
+            return work;
+        }
+        let stats = self.clone();
+        Work::new(move |state| {
+            stats.with_target_accounting_lock(serialization_lock.as_deref(), |locked| {
+                if !locked {
+                    return work.call(state);
+                }
+                let before = stats.snapshot_target_paths(&paths);
+                let result = work.call(state);
+                let after = stats.snapshot_target_paths(&paths);
+                stats.record_target_snapshots(before, after);
+                result
+            })
+        })
+    }
+
+    pub(crate) fn with_target_accounting_lock<T>(
+        &self,
+        serialization_lock: Option<&Path>,
+        work: impl FnOnce(bool) -> CargoResult<T>,
+    ) -> CargoResult<T> {
+        let Some(serialization_lock) = serialization_lock else {
+            // The caller is already inside Cargo's exclusive build/artifact or
+            // fine-grained unit lock when no supplemental lock is needed.
+            return work(true);
+        };
+        let lock = match lock_target_accounting(serialization_lock) {
+            Ok(lock) => Some(lock),
+            Err(error) => {
+                debug!(error = ?error, path = %serialization_lock.display(), "cargo target disk accounting lock unavailable");
+                None
+            }
+        };
+        work(lock.is_some())
+    }
+
+    pub(crate) fn snapshot_target_paths(&self, paths: &[PathBuf]) -> Vec<Option<FileUsage>> {
+        paths.iter().map(|path| snapshot_file(path)).collect()
+    }
+
+    pub(crate) fn record_target_snapshots(
+        &self,
+        before: Vec<Option<FileUsage>>,
+        after: Vec<Option<FileUsage>>,
+    ) {
+        for (before, after) in before.into_iter().zip(after) {
+            self.record_target_transition(before, after);
+        }
+    }
+
     /// Emits a machine-searchable end-of-build summary only when the cache's
-    /// debug tracing target is enabled. Ordinary Cargo output remains quiet.
+    /// info tracing target is enabled. Ordinary Cargo output remains quiet
+    /// when Cargo logging is disabled.
     pub(crate) fn log_summary(&self) {
+        if !self.enabled() {
+            return;
+        }
         let skips = self
             .0
             .skips
             .lock()
             .expect("cargo-cas skip counter poisoned")
             .clone();
-        debug!(
+        let mut miss_reasons = self
+            .0
+            .miss_reasons
+            .lock()
+            .expect("cargo-cas miss counter poisoned")
+            .iter()
+            .map(|(reason, count)| (*reason, *count))
+            .collect::<Vec<_>>();
+        miss_reasons.sort_unstable_by(|(reason_a, count_a), (reason_b, count_b)| {
+            count_b.cmp(count_a).then_with(|| reason_a.cmp(reason_b))
+        });
+        miss_reasons.truncate(3);
+        let mut reject_reasons = self
+            .0
+            .reject_reasons
+            .lock()
+            .expect("cargo-cas reject counter poisoned")
+            .iter()
+            .map(|(reason, count)| (*reason, *count))
+            .collect::<Vec<_>>();
+        reject_reasons.sort_unstable_by(|(reason_a, count_a), (reason_b, count_b)| {
+            count_b.cmp(count_a).then_with(|| reason_a.cmp(reason_b))
+        });
+        reject_reasons.truncate(3);
+        info!(
             eligible = self.0.eligible.load(Ordering::Relaxed),
             hits = self.0.hits.load(Ordering::Relaxed),
             misses = self.0.misses.load(Ordering::Relaxed),
@@ -118,9 +320,204 @@ impl CacheStats {
             eligible_rustc = self.0.eligible_rustc.load(Ordering::Relaxed),
             duplicate_build_avoidance = self.0.duplicate_build_avoidance.load(Ordering::Relaxed),
             skips = ?skips,
+            top_miss_reasons = ?miss_reasons,
+            top_reject_reasons = ?reject_reasons,
+            target_logical_added = self.0.target_logical_added.load(Ordering::Relaxed),
+            target_logical_removed = self.0.target_logical_removed.load(Ordering::Relaxed),
+            target_allocated_added = self.0.target_allocated_added.load(Ordering::Relaxed),
+            target_allocated_removed = self.0.target_allocated_removed.load(Ordering::Relaxed),
+            target_logical_delta = signed_delta(
+                self.0.target_logical_added.load(Ordering::Relaxed),
+                self.0.target_logical_removed.load(Ordering::Relaxed),
+            ),
+            target_allocated_delta = signed_delta(
+                self.0.target_allocated_added.load(Ordering::Relaxed),
+                self.0.target_allocated_removed.load(Ordering::Relaxed),
+            ),
+            cache_logical_added = self.0.cache_logical_added.load(Ordering::Relaxed),
+            cache_logical_removed = self.0.cache_logical_removed.load(Ordering::Relaxed),
+            cache_allocated_added = self.0.cache_allocated_added.load(Ordering::Relaxed),
+            cache_allocated_removed = self.0.cache_allocated_removed.load(Ordering::Relaxed),
+            cache_logical_delta = signed_delta(
+                self.0.cache_logical_added.load(Ordering::Relaxed),
+                self.0.cache_logical_removed.load(Ordering::Relaxed),
+            ),
+            cache_allocated_delta = signed_delta(
+                self.0.cache_allocated_added.load(Ordering::Relaxed),
+                self.0.cache_allocated_removed.load(Ordering::Relaxed),
+            ),
             "cargo-cas summary"
         );
     }
+
+    pub(crate) fn summary_guard(&self) -> CacheStatsSummaryGuard {
+        CacheStatsSummaryGuard(self.enabled().then(|| self.clone()))
+    }
+}
+
+struct TargetAccountingLock(File);
+
+impl Drop for TargetAccountingLock {
+    fn drop(&mut self) {
+        let _ = crate::util::flock::unlock(&self.0);
+    }
+}
+
+fn lock_target_accounting(path: &Path) -> io::Result<TargetAccountingLock> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(path)?;
+    crate::util::flock::lock_exclusive(&file)?;
+    Ok(TargetAccountingLock(file))
+}
+
+/// Emits exactly one summary when a compilation exits, including failures
+/// that happen while preparing the queue rather than while executing a job.
+pub(crate) struct CacheStatsSummaryGuard(Option<CacheStats>);
+
+impl Drop for CacheStatsSummaryGuard {
+    fn drop(&mut self) {
+        if let Some(stats) = &self.0 {
+            stats.log_summary();
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FileUsage {
+    logical: u64,
+    allocated: u64,
+    device: u64,
+    inode: u64,
+    links: u64,
+}
+
+impl FileUsage {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            logical: metadata.len(),
+            allocated: allocated_bytes(metadata),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(not(unix))]
+            device: 0,
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            #[cfg(not(unix))]
+            inode: 0,
+            #[cfg(unix)]
+            links: metadata.nlink(),
+            #[cfg(not(unix))]
+            links: 1,
+        }
+    }
+}
+
+fn snapshot_file(path: &Path) -> Option<FileUsage> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_file() {
+        return None;
+    }
+    Some(FileUsage::from_metadata(&metadata))
+}
+
+#[cfg(unix)]
+fn allocated_bytes(metadata: &fs::Metadata) -> u64 {
+    metadata.blocks().saturating_mul(512)
+}
+
+#[cfg(not(unix))]
+fn allocated_bytes(metadata: &fs::Metadata) -> u64 {
+    metadata.len()
+}
+
+fn record_transition(
+    before: Option<FileUsage>,
+    after: Option<FileUsage>,
+    logical_added: &AtomicU64,
+    logical_removed: &AtomicU64,
+    allocated_added: &AtomicU64,
+    allocated_removed: &AtomicU64,
+) {
+    let same_inode =
+        matches!((before, after), (Some(before), Some(after)) if same_file(before, after));
+    match (before, after) {
+        (Some(before), Some(after)) if same_inode => {
+            record_signed_delta(
+                before.logical,
+                after.logical,
+                logical_added,
+                logical_removed,
+            );
+            // A hardlink restore does not allocate new physical blocks in the
+            // target. Its link count is greater than one, so only charge a
+            // physical delta for a private inode.
+            if before.links <= 1 && after.links <= 1 {
+                record_signed_delta(
+                    before.allocated,
+                    after.allocated,
+                    allocated_added,
+                    allocated_removed,
+                );
+            }
+        }
+        (Some(before), Some(after)) => {
+            if before.links <= 1 {
+                allocated_removed.fetch_add(before.allocated, Ordering::Relaxed);
+            }
+            logical_removed.fetch_add(before.logical, Ordering::Relaxed);
+            if after.links <= 1 {
+                allocated_added.fetch_add(after.allocated, Ordering::Relaxed);
+            }
+            logical_added.fetch_add(after.logical, Ordering::Relaxed);
+        }
+        (Some(before), None) => {
+            logical_removed.fetch_add(before.logical, Ordering::Relaxed);
+            if before.links <= 1 {
+                allocated_removed.fetch_add(before.allocated, Ordering::Relaxed);
+            }
+        }
+        (None, Some(after)) => {
+            logical_added.fetch_add(after.logical, Ordering::Relaxed);
+            if after.links <= 1 {
+                allocated_added.fetch_add(after.allocated, Ordering::Relaxed);
+            }
+        }
+        (None, None) => {}
+    }
+}
+
+#[cfg(unix)]
+fn same_file(before: FileUsage, after: FileUsage) -> bool {
+    before.device == after.device && before.inode == after.inode
+}
+
+#[cfg(not(unix))]
+fn same_file(_before: FileUsage, _after: FileUsage) -> bool {
+    false
+}
+
+fn record_signed_delta(
+    before: u64,
+    after: u64,
+    added: &AtomicU64,
+    removed: &AtomicU64,
+) {
+    if after >= before {
+        added.fetch_add(after - before, Ordering::Relaxed);
+    } else {
+        removed.fetch_add(before - after, Ordering::Relaxed);
+    }
+}
+
+fn signed_delta(added: u64, removed: u64) -> i128 {
+    i128::from(added) - i128::from(removed)
 }
 
 /// A collision-resistant identity for a pre-compilation action.
@@ -169,6 +566,7 @@ pub(crate) struct CachePublication {
         Arc<Mutex<BuildScriptOutputs>>,
         Vec<super::UnitHash>,
     )>,
+    stats: CacheStats,
 }
 
 /// A cacheable, non-native build-script execution. The script binary itself
@@ -335,21 +733,21 @@ impl BuildScriptCache {
 impl BuildScriptCacheAction {
     fn lookup(&self) -> Option<BuildScriptCacheEntry> {
         if !is_plain_directory(&self.cache) {
-            self.stats.miss();
+            self.stats.miss("cache_root_unavailable");
             return None;
         }
         let root = self.cache.join(self.key.as_str());
         if !is_plain_directory(&root) {
-            self.stats.miss();
+            self.stats.miss("entry_absent");
             return None;
         }
         let manifest_path = root.join(BUILD_SCRIPT_MANIFEST_FILE);
         let Ok(bytes) = read_regular_file(&manifest_path) else {
-            self.stats.miss();
+            self.stats.miss("manifest_unavailable");
             return None;
         };
         let Ok(manifest) = serde_json::from_slice::<BuildScriptCacheManifest>(&bytes) else {
-            self.stats.reject();
+            self.stats.reject("malformed_manifest");
             return None;
         };
         if manifest.format_version != CACHE_FORMAT_VERSION
@@ -358,10 +756,10 @@ impl BuildScriptCacheAction {
             || !declared_environment_matches(&manifest.environment)
             || !validate_build_script_entry(&root, &manifest)
         {
-            self.stats.reject();
+            self.stats.reject("incompatible_manifest");
             return None;
         }
-        mark_used(&self.cache, self.key.as_str());
+        mark_used(&self.cache, self.key.as_str(), Some(&self.stats));
         self.stats.hit();
         Some(BuildScriptCacheEntry { root, manifest })
     }
@@ -408,7 +806,7 @@ impl BuildScriptCacheAction {
         let final_entry = self.cache.join(self.key.as_str());
         if fs::symlink_metadata(&final_entry).is_ok() {
             if build_script_entry_is_valid(&final_entry, &self.key, &self.identity) {
-                mark_used(&self.cache, self.key.as_str());
+                mark_used(&self.cache, self.key.as_str(), Some(&self.stats));
                 return Ok(());
             }
             remove_entry(&final_entry)?;
@@ -423,10 +821,14 @@ impl BuildScriptCacheAction {
         let temporary_artifacts = temporary_entry.join(ARTIFACTS_DIRECTORY);
         fs::create_dir_all(&temporary_artifacts)?;
         let mut manifest_files = Vec::with_capacity(files.len());
+        let mut staged_usage = self.stats.enabled().then(|| Vec::with_capacity(files.len() + 1));
         for (index, relative, source) in files {
             let destination = temporary_artifacts.join(index.to_string());
             fs::copy(&source, &destination)?;
             let metadata = fs::metadata(&destination)?;
+            if let Some(staged_usage) = &mut staged_usage {
+                staged_usage.push(FileUsage::from_metadata(&metadata));
+            }
             manifest_files.push(CachedBuildScriptFile {
                 file: format!("{}", relative.display()),
                 artifact: index.to_string(),
@@ -443,23 +845,31 @@ impl BuildScriptCacheAction {
             environment: declared_environment,
             files: manifest_files,
         };
-        paths::write_atomic(
-            temporary_entry.join(BUILD_SCRIPT_MANIFEST_FILE),
-            serde_json::to_vec(&manifest)?,
-        )?;
+        let manifest_path = temporary_entry.join(BUILD_SCRIPT_MANIFEST_FILE);
+        paths::write_atomic(&manifest_path, serde_json::to_vec(&manifest)?)?;
+        if let Some(staged_usage) = &mut staged_usage {
+            staged_usage.push(FileUsage::from_metadata(&fs::metadata(&manifest_path)?));
+        }
         if !build_script_entry_is_valid(&temporary_entry, &self.key, &self.identity) {
             let _ = fs::remove_dir_all(&temporary_entry);
             return Ok(());
         }
-        if let Err(error) = fs::rename(&temporary_entry, &final_entry)
-            && error.kind() != io::ErrorKind::AlreadyExists
-        {
-            return Err(error.into());
-        }
+        let published = match fs::rename(&temporary_entry, &final_entry) {
+            Ok(()) => true,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
+            Err(error) => return Err(error.into()),
+        };
         if temporary_entry.exists() {
             let _ = fs::remove_dir_all(&temporary_entry);
         }
-        mark_used(&self.cache, self.key.as_str());
+        if published {
+            if let Some(staged_usage) = staged_usage {
+                for usage in staged_usage {
+                    self.stats.record_cache_usage(usage, true);
+                }
+            }
+        }
+        mark_used(&self.cache, self.key.as_str(), Some(&self.stats));
         Ok(())
     }
 }
@@ -762,7 +1172,7 @@ impl CacheAction {
     fn lookup_inner(&self, count_miss: bool) -> Option<CacheEntry> {
         if !is_plain_directory(&self.cache) {
             if count_miss {
-                self.stats.miss();
+                self.stats.miss("cache_root_unavailable");
             }
             debug!(path = %self.cache.display(), "cargo-cas miss: cache root unavailable");
             return None;
@@ -770,7 +1180,7 @@ impl CacheAction {
         let root = self.cache.join(self.key.as_str());
         if !is_plain_directory(&root) {
             if count_miss {
-                self.stats.miss();
+                self.stats.miss("entry_absent");
             }
             debug!(key = self.key.as_str(), "cargo-cas miss: entry absent");
             return None;
@@ -778,7 +1188,7 @@ impl CacheAction {
         let manifest_path = root.join(MANIFEST_FILE);
         let Ok(manifest_bytes) = read_regular_file(&manifest_path) else {
             if count_miss {
-                self.stats.miss();
+                self.stats.miss("manifest_unavailable");
             }
             debug!(
                 key = self.key.as_str(),
@@ -787,7 +1197,7 @@ impl CacheAction {
             return None;
         };
         let Ok(manifest) = serde_json::from_slice::<CacheManifestV1>(&manifest_bytes) else {
-            self.stats.reject();
+            self.stats.reject("malformed_manifest");
             warn!(path = %manifest_path.display(), "ignoring malformed cargo-cas cache manifest");
             debug!(
                 key = self.key.as_str(),
@@ -800,7 +1210,7 @@ impl CacheAction {
             || manifest.action_key != self.key.as_str()
             || manifest.identity != self.identity
         {
-            self.stats.reject();
+            self.stats.reject("incompatible_manifest");
             warn!(path = %manifest_path.display(), "ignoring incompatible cargo-cas cache manifest");
             debug!(
                 key = self.key.as_str(),
@@ -809,13 +1219,13 @@ impl CacheAction {
             return None;
         }
         if !validate_manifest(&root, &manifest) {
-            self.stats.reject();
+            self.stats.reject("corrupt_entry");
             warn!(path = %manifest_path.display(), "ignoring corrupt cargo-cas cache entry");
             debug!(key = self.key.as_str(), "cargo-cas reject: corrupt entry");
             return None;
         }
         if !manifest_matches_expected(&manifest, &self.artifacts) {
-            self.stats.reject();
+            self.stats.reject("unexpected_artifacts");
             warn!(path = %manifest_path.display(), "ignoring cargo-cas entry with unexpected artifacts");
             debug!(
                 key = self.key.as_str(),
@@ -824,7 +1234,7 @@ impl CacheAction {
             return None;
         }
 
-        mark_used(&self.cache, self.key.as_str());
+        mark_used(&self.cache, self.key.as_str(), Some(&self.stats));
         self.stats.hit();
         debug!(key = self.key.as_str(), "cargo-cas hit");
         Some(CacheEntry { root, manifest })
@@ -869,22 +1279,23 @@ impl CacheAction {
 
         Work::new(move |state| {
             let restored: CargoResult<()> = (|| {
-                for (source, destination, uplift, role, size, digest) in restores {
+                for (source, destination, uplift, role, size, digest) in &restores {
                     let parent = destination.parent().expect("Cargo output path has parent");
                     paths::create_dir_all(parent)?;
                     materialize_verified_artifact(
-                        &source,
-                        &destination,
+                        source,
+                        destination,
                         uplift.as_deref(),
-                        role,
-                        size,
-                        &digest,
+                        *role,
+                        *size,
+                        digest,
                     )?;
-                    if role == ArtifactRole::Rmeta {
+                    if *role == ArtifactRole::Rmeta {
                         // Pipelined metadata consumers can begin as soon as
                         // the restored `.rmeta` is locally available. The
                         // manifest always places this role before the
                         // linkable artifact and dep-info transport files.
+                        //
                         state.rmeta_produced();
                         pause_after_rmeta_for_test();
                     }
@@ -900,12 +1311,14 @@ impl CacheAction {
                         // reusable artifact set fail a valid Cargo build.
                         warn!(error = ?error, "failed to replay cargo-cas diagnostics; compiling normally");
                         stats.eligible_rustc();
+                        state.cache_restore_fallback();
                         normal_work.call(state)
                     }
                 },
                 Err(error) => {
                     warn!(error = ?error, "cargo-cas entry disappeared during restore; compiling normally");
                     stats.eligible_rustc();
+                    state.cache_restore_fallback();
                     normal_work.call(state)
                 }
             }
@@ -982,6 +1395,7 @@ pub(crate) fn publication(
         build_script_outputs: build_runner
             .find_build_script_metadatas(unit)
             .map(|metadata| (Arc::clone(&build_runner.build_script_outputs), metadata)),
+        stats: build_runner.cas_stats.clone(),
     }))
 }
 
@@ -1040,7 +1454,7 @@ impl CachePublication {
         if fs::symlink_metadata(&final_entry).is_ok() {
             if entry_is_valid(&final_entry, &self.key, &self.identity, &self.artifacts) {
                 self.materialize_shared_artifacts(&final_entry)?;
-                mark_used(&self.cache, self.key.as_str());
+                mark_used(&self.cache, self.key.as_str(), Some(&self.stats));
                 return Ok(());
             }
             // A process that died before publication cannot leave a final
@@ -1062,6 +1476,10 @@ impl CachePublication {
         fs::create_dir(&temporary_artifacts)?;
 
         let mut manifest_artifacts = Vec::with_capacity(self.artifacts.len());
+        let mut staged_usage = self
+            .stats
+            .enabled()
+            .then(|| Vec::with_capacity(self.artifacts.len() + 1));
         for (index, artifact) in self.artifacts.iter().enumerate() {
             if !artifact.required && !artifact.source.is_file() {
                 continue;
@@ -1073,6 +1491,9 @@ impl CachePublication {
                 make_readonly(&staged)?;
             }
             let metadata = fs::metadata(&staged)?;
+            if let Some(staged_usage) = &mut staged_usage {
+                staged_usage.push(FileUsage::from_metadata(&metadata));
+            }
             let digest = digest_file(&staged)?;
             manifest_artifacts.push(CachedArtifact {
                 role: artifact.role,
@@ -1089,10 +1510,11 @@ impl CachePublication {
             identity: self.identity.clone(),
             artifacts: manifest_artifacts,
         };
-        paths::write_atomic(
-            temporary_entry.join(MANIFEST_FILE),
-            serde_json::to_vec(&manifest)?,
-        )?;
+        let manifest_path = temporary_entry.join(MANIFEST_FILE);
+        paths::write_atomic(&manifest_path, serde_json::to_vec(&manifest)?)?;
+        if let Some(staged_usage) = &mut staged_usage {
+            staged_usage.push(FileUsage::from_metadata(&fs::metadata(&manifest_path)?));
+        }
         if !entry_is_valid(&temporary_entry, &self.key, &self.identity, &self.artifacts) {
             let _ = fs::remove_dir_all(&temporary_entry);
             return Err(io::Error::other("staged cargo-cas entry failed validation").into());
@@ -1103,16 +1525,23 @@ impl CachePublication {
         // `tmp` and the final entry are both below the same cache root, so rename
         // makes a completed entry visible atomically.  If another writer won the
         // race, its immutable entry is equally valid and ours is discarded.
-        if let Err(error) = fs::rename(&temporary_entry, &final_entry)
-            && error.kind() != io::ErrorKind::AlreadyExists
-        {
-            return Err(error.into());
-        }
+        let published = match fs::rename(&temporary_entry, &final_entry) {
+            Ok(()) => true,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
+            Err(error) => return Err(error.into()),
+        };
         if temporary_entry.exists() {
             let _ = fs::remove_dir_all(&temporary_entry);
         }
+        if published {
+            if let Some(staged_usage) = staged_usage {
+                for usage in staged_usage {
+                    self.stats.record_cache_usage(usage, true);
+                }
+            }
+        }
         self.materialize_shared_artifacts(&final_entry)?;
-        mark_used(&self.cache, self.key.as_str());
+        mark_used(&self.cache, self.key.as_str(), Some(&self.stats));
         Ok(())
     }
 
@@ -2158,22 +2587,39 @@ fn is_action_key_name(name: &str) -> bool {
     name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn mark_used(cache: &Path, key: &str) {
+fn mark_used(cache: &Path, key: &str, stats: Option<&CacheStats>) {
     let result = (|| -> io::Result<()> {
         let access = ensure_cache_subdirectory(cache, ACCESS_DIRECTORY)?.join(key);
         let mut options = OpenOptions::new();
-        options.create(true).append(true);
+        options.write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
 
             options.custom_flags(libc::O_NOFOLLOW);
         }
-        let file = options.open(access)?;
+        let (file, created) = match options.open(&access) {
+            Ok(file) => (file, true),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let mut existing = OpenOptions::new();
+                existing.read(true).append(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+
+                    existing.custom_flags(libc::O_NOFOLLOW);
+                }
+                (existing.open(&access)?, false)
+            }
+            Err(error) => return Err(error),
+        };
         if !file.metadata()?.file_type().is_file() {
             return Err(io::Error::other(
                 "cargo-cas access entry is not a regular file",
             ));
+        }
+        if created && let Some(stats) = stats.filter(|stats| stats.enabled()) {
+            stats.record_cache_usage(FileUsage::from_metadata(&file.metadata()?), true);
         }
         file.set_times(fs::FileTimes::new().set_modified(SystemTime::now()))
     })();

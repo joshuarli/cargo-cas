@@ -356,12 +356,22 @@ that can be rebuilt. CAS entries are not part of automatic source-cache GC.
 
 ## Observability and verification
 
-`CARGO_LOG=cargo::compiler::cas=debug` reports per-action `hit`, `miss`,
-`reject`, and conservative `skip` decisions. Each cache-enabled invocation
-also emits one process-local `cargo-cas summary` with eligible units, hits,
+Each compilation invocation emits one process-local `cargo-cas summary` by
+default. `CARGO_LOG=cargo::compiler::cas=debug` additionally reports per-action
+`hit`, `miss`, `reject`, and conservative `skip` decisions. The summary includes
+eligible units, hits,
 misses, rejects, eligible rustc work, same-key duplicate-build avoidance, and
-skip counts. These counters are diagnostic only; immutable entries do not gain
-mutable statistics.
+skip counts. The summary also includes the top three miss reasons and logical
+and filesystem-allocated bytes added/removed from target-owned unit paths and
+the global CAS store. These are mutation counters rather than directory or
+free-space snapshots: target paths are observed around unit work under Cargo's
+exclusive build/unit lock (shared-lock checks use a dedicated accounting lock),
+while cache bytes are charged only after the writer that wins atomic
+publication. A hardlink restore therefore adds target logical bytes but no new
+physical allocation, and overlapping Cargo processes cannot charge one
+another's cache publication. Immutable entries do not gain mutable statistics.
+`CARGO_LOG=off` disables the summary and short-circuits its path snapshots,
+accounting locks, reason maps, and publication byte metadata.
 
 The macOS acceptance suite `tests/testsuite/cargo_cas.rs` covers the contract,
 including:
@@ -375,7 +385,7 @@ including:
 * atomic publication, killed writers, partial/corrupt entries, missing or
   substituted cache roots and internal directories;
 * same-key single-compilation coordination, different-key parallelism, and
-  eight-worktree reuse; and
+  eight-worktree reuse, including one-writer cache-byte accounting; and
 * explicit age/size GC.
 
 The synthetic benchmark is reproducible with

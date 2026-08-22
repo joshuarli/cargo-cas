@@ -73,6 +73,16 @@ impl Job {
         self.work.call(state)
     }
 
+    /// Applies a wrapper to the unit's work while preserving its freshness.
+    /// This is used for accounting that must surround all of a unit's Cargo
+    /// work, including any work chained by the scheduler.
+    pub fn wrap_work(self, wrapper: impl FnOnce(Work) -> Work) -> Job {
+        Job {
+            work: wrapper(self.work),
+            fresh: self.fresh,
+        }
+    }
+
     /// Returns whether this job was fresh/dirty, where "fresh" means we're
     /// likely to perform just some small bookkeeping where "dirty" means we'll
     /// probably do something slow like invoke rustc.

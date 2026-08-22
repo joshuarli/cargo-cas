@@ -208,7 +208,7 @@ fn compile<'gctx>(
         // we've got everything constructed.
         fingerprint::prepare_init(build_runner, unit)?;
 
-        let job = if unit.mode.is_run_custom_build() {
+        let mut job = if unit.mode.is_run_custom_build() {
             let cas_build_script = cas::prepare_build_script(build_runner, unit)?;
             let replay = cas_build_script
                 .as_ref()
@@ -261,25 +261,43 @@ fn compile<'gctx>(
                 work.then(link_targets(build_runner, unit, true)?)
             });
 
-            // If -Zfine-grain-locking is enabled, we wrap the job with an upgrade to exclusive
-            // lock before starting, then downgrade to a shared lock after the job is finished.
-            if build_runner.bcx.gctx.cli_unstable().fine_grain_locking && job.freshness().is_dirty()
-            {
-                if let Some(lock) = lock {
-                    // Here we unlock the current shared lock to avoid deadlocking with other cargo
-                    // processes. Then we configure our compile job to take an exclusive lock
-                    // before starting. Once we are done compiling (including both rmeta and rlib)
-                    // we downgrade to a shared lock to allow other cargo's to read the build unit.
-                    // We will hold this shared lock for the remainder of compilation to prevent
-                    // other cargo from re-compiling while we are still using the unit.
-                    build_runner.lock_manager.unlock(&lock)?;
-                    job.before(prebuild_lock_exclusive(lock.clone()));
-                    job.after(downgrade_lock_to_shared(lock));
-                }
-            }
-
             job
         };
+        if job.freshness().is_dirty() && build_runner.cas_stats.enabled() {
+            let tracked_paths = build_runner.disk_tracking_paths(unit)?;
+            let shared_check = matches!(
+                &build_runner.bcx.build_config.intent,
+                UserIntent::Check { .. }
+            );
+            let serialization_lock = (shared_check
+                && (unit.mode.is_check() || unit.mode.is_run_custom_build())
+                && !build_runner.bcx.gctx.cli_unstable().fine_grain_locking)
+                .then(|| build_runner.disk_tracking_serialization_lock());
+            job = job.wrap_work(|work| {
+                build_runner
+                    .cas_stats
+                    .track_target_paths(serialization_lock, tracked_paths, work)
+            });
+        }
+
+        // If -Zfine-grain-locking is enabled, acquire the exclusive unit lock
+        // before the accounting snapshot and downgrade only after the snapshot
+        // is complete. This keeps concurrent Cargo writers outside this unit's
+        // measured interval.
+        if build_runner.bcx.gctx.cli_unstable().fine_grain_locking && job.freshness().is_dirty()
+        {
+            if let Some(lock) = lock {
+                // Here we unlock the current shared lock to avoid deadlocking with other cargo
+                // processes. Then we configure our compile job to take an exclusive lock
+                // before starting. Once we are done compiling (including both rmeta and rlib)
+                // we downgrade to a shared lock to allow other cargo's to read the build unit.
+                // We will hold this shared lock for the remainder of compilation to prevent
+                // other cargo from re-compiling while we are still using the unit.
+                build_runner.lock_manager.unlock(&lock)?;
+                job.before(prebuild_lock_exclusive(lock.clone()));
+                job.after(downgrade_lock_to_shared(lock));
+            }
+        }
         jobs.enqueue(build_runner, unit, job)?;
     }
 
@@ -452,9 +470,23 @@ fn rustc(
             // rmeta in place on some toolchain paths, so detach any readonly
             // output before normal work. The target directory remains Cargo
             // owned and a successful rustc invocation recreates this file.
-            if fs::symlink_metadata(&output.path).is_ok_and(|metadata| {
+            let readonly = fs::symlink_metadata(&output.path).is_ok_and(|metadata| {
                 metadata.file_type().is_file() && metadata.permissions().readonly()
-            }) {
+            });
+            if readonly
+                && state.preserves_cache_restore_rmeta()
+                && output.path.extension() == Some(OsStr::new("rmeta"))
+            {
+                // A dependent may already have been released by a cache hit's
+                // metadata edge. Replace the hardlink atomically with a
+                // writable private copy before fallback rustc starts, so its
+                // cleanup cannot make that dependent observe a missing rmeta.
+                let bytes = fs::read(&output.path)?;
+                paths::write_atomic(&output.path, &bytes)?;
+                let mut permissions = fs::metadata(&output.path)?.permissions();
+                permissions.set_readonly(false);
+                fs::set_permissions(&output.path, permissions)?;
+            } else if readonly {
                 paths::remove_file(&output.path)?;
             }
 

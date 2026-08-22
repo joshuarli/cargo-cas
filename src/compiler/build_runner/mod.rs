@@ -174,6 +174,7 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
     /// [`ops::cargo_compile`]: crate::ops::cargo_compile
     #[tracing::instrument(skip_all)]
     pub fn compile(mut self, exec: &Arc<dyn Executor>) -> CargoResult<Compilation<'gctx>> {
+        let _summary = self.cas_stats.summary_guard();
         // A shared lock is held during the duration of the build since rustc
         // needs to read from the `src` cache, and we don't want other
         // commands modifying the `src` cache while it is running.
@@ -213,7 +214,6 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
 
         // Now that we've figured out everything that we're going to do, do it!
         queue.execute(&mut self)?;
-        self.cas_stats.log_summary();
 
         // Add `OUT_DIR` to env vars if unit has a build script.
         let units_with_build_script = &self
@@ -303,7 +303,34 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
                 });
             }
 
-            super::output_depinfo(&mut self, unit)?;
+            if self.cas_stats.enabled() {
+                let tracked_paths = self.disk_tracking_paths(unit)?;
+                let shared_check = matches!(
+                    &self.bcx.build_config.intent,
+                    UserIntent::Check { .. }
+                );
+                let serialization_lock =
+                    shared_check.then(|| self.disk_tracking_serialization_lock());
+                let stats = self.cas_stats.clone();
+                let result = stats.with_target_accounting_lock(
+                    serialization_lock.as_deref(),
+                    |locked| {
+                        if !locked {
+                            return super::output_depinfo(&mut self, unit);
+                        }
+                        let before = stats.snapshot_target_paths(&tracked_paths);
+                        let result = super::output_depinfo(&mut self, unit);
+                        let after = stats.snapshot_target_paths(&tracked_paths);
+                        stats.record_target_snapshots(before, after);
+                        result
+                    },
+                );
+                if let Err(error) = result {
+                    return Err(error);
+                }
+            } else {
+                super::output_depinfo(&mut self, unit)?;
+            }
         }
 
         for (script_meta, output) in self.build_script_outputs.lock().unwrap().iter() {
@@ -525,6 +552,46 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
     /// Returns the filenames that the given unit will generate.
     pub fn outputs(&self, unit: &Unit) -> CargoResult<Arc<Vec<OutputFile>>> {
         self.files.as_ref().unwrap().outputs(unit, self.bcx)
+    }
+
+    /// Returns the concrete Cargo-owned files whose mutations belong to one
+    /// compilation unit. Disk reporting observes these paths around the unit
+    /// work; it deliberately does not walk `target/` or sample filesystem
+    /// free space, which would race unrelated Cargo invocations.
+    pub(crate) fn disk_tracking_paths(&self, unit: &Unit) -> CargoResult<Vec<PathBuf>> {
+        let mut paths = self
+            .outputs(unit)?
+            .iter()
+            .flat_map(|output| {
+                let dep_info = output.hardlink.as_ref().map(|path| path.with_extension("d"));
+                std::iter::once(output.path.clone())
+                    .chain(output.hardlink.clone())
+                    .chain(dep_info)
+            })
+            .collect::<Vec<_>>();
+        paths.push(self.files().fingerprint_file_path(unit, ""));
+        paths.push(self.files().fingerprint_file_path(unit, "dep-"));
+        paths.push(self.files().message_cache_path(unit));
+        if unit.mode.is_run_custom_build() {
+            let run_root = self.files().build_script_run_dir(unit);
+            paths.extend([
+                run_root.join("stdout"),
+                run_root.join("output"),
+                run_root.join("stderr"),
+                run_root.join("root-output"),
+            ]);
+        }
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
+    }
+
+    pub(crate) fn disk_tracking_serialization_lock(&self) -> PathBuf {
+        self.bcx
+            .ws
+            .target_dir()
+            .join(".cargo-disk-stats-lock")
+            .into_path_unlocked()
     }
 
     /// Direct dependencies for the given unit.

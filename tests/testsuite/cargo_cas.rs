@@ -37,6 +37,24 @@ fn run_check_with_cas_log(project: &Project, target_dir: &Path) -> RawOutput {
     cargo.run()
 }
 
+fn run_check_with_default_cas_log(project: &Project, target_dir: &Path) -> RawOutput {
+    let mut cargo = project.cargo("check -vv");
+    cargo
+        .arg("--target-dir")
+        .arg(target_dir)
+        .env_remove("CARGO_LOG");
+    cargo.run()
+}
+
+fn run_check_with_cas_log_off(project: &Project, target_dir: &Path) -> RawOutput {
+    let mut cargo = project.cargo("check -vv");
+    cargo
+        .arg("--target-dir")
+        .arg(target_dir)
+        .env("CARGO_LOG", "off");
+    cargo.run()
+}
+
 fn run_check_with_cas_log_in(project: &Project, cwd: &Path, target_dir: &Path) -> RawOutput {
     let mut cargo = project.cargo("check -vv");
     cargo
@@ -415,6 +433,21 @@ fn directory_file_size(path: &Path) -> u64 {
 fn contains_path(bytes: &[u8], path: &Path) -> bool {
     let path = path.to_str().unwrap().as_bytes();
     bytes.windows(path.len()).any(|window| window == path)
+}
+
+fn summary_field(output: &Output, field: &str) -> Option<u64> {
+    summary_field_bytes(&output.stderr, field)
+}
+
+fn summary_field_bytes(stderr: &[u8], field: &str) -> Option<u64> {
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .find(|line| line.contains("cargo-cas summary"))
+        .and_then(|line| {
+            line.split_whitespace()
+                .find_map(|token| token.strip_prefix(&format!("{field}=")))
+        })
+        .and_then(|value| value.trim_end_matches(',').parse().ok())
 }
 
 fn assert_valid_cache_entry(entry: &Path) {
@@ -1303,6 +1336,19 @@ edition = "2024"
         "one initial lookup must count as one miss, not a coordination recheck:\n{}",
         String::from_utf8_lossy(&first_output.stderr)
     );
+    assert!(
+        String::from_utf8_lossy(&first_output.stderr).contains("top_miss_reasons=[(\"")
+            && (String::from_utf8_lossy(&first_output.stderr).contains("cache_root_unavailable")
+                || String::from_utf8_lossy(&first_output.stderr).contains("entry_absent")),
+        "the summary must identify its top miss reason:\n{}",
+        String::from_utf8_lossy(&first_output.stderr)
+    );
+    assert!(
+        summary_field_bytes(&first_output.stderr, "target_logical_added").is_some()
+            && summary_field_bytes(&first_output.stderr, "cache_logical_added").is_some(),
+        "the summary must include target and global CAS byte deltas:\n{}",
+        String::from_utf8_lossy(&first_output.stderr)
+    );
 
     let second_output = run_check_with_cas_log(
         &second,
@@ -1318,6 +1364,33 @@ edition = "2024"
         String::from_utf8_lossy(&second_output.stderr).contains("hits=1"),
         "the warm build summary should report its cache hit:\n{}",
         String::from_utf8_lossy(&second_output.stderr)
+    );
+    assert_eq!(
+        summary_field_bytes(&second_output.stderr, "cache_logical_added"),
+        Some(0),
+        "a cache reader must not claim the immutable entry's bytes:\n{}",
+        String::from_utf8_lossy(&second_output.stderr)
+    );
+
+    let default_output = run_check_with_default_cas_log(
+        &second,
+        &paths::root().join("cas-observability-default-target"),
+    );
+    assert!(
+        String::from_utf8_lossy(&default_output.stderr).contains("cargo-cas summary"),
+        "CAS statistics should be enabled by default:\n{}",
+        String::from_utf8_lossy(&default_output.stderr)
+    );
+    let disabled_target = paths::root().join("cas-observability-disabled-target");
+    let disabled_output = run_check_with_cas_log_off(&second, &disabled_target);
+    assert!(
+        !String::from_utf8_lossy(&disabled_output.stderr).contains("cargo-cas summary"),
+        "CARGO_LOG=off should disable CAS statistics:\n{}",
+        String::from_utf8_lossy(&disabled_output.stderr)
+    );
+    assert!(
+        !disabled_target.join(".cargo-disk-stats-lock").exists(),
+        "CARGO_LOG=off should skip target accounting locks"
     );
 
     let path_first_output = run_check_with_cas_log(
@@ -2917,6 +2990,22 @@ edition = "2024"
             String::from_utf8_lossy(&output.stderr).contains(&format!("--crate-name {ROOT_CRATE}"))
         }),
         "every distinct worktree root must compile independently"
+    );
+    assert!(
+        outputs.iter().all(|output| {
+            String::from_utf8_lossy(&output.stderr).contains("cargo-cas summary")
+                && summary_field(output, "target_logical_added").is_some()
+                && summary_field(output, "cache_allocated_added").is_some()
+        }),
+        "every concurrent build must emit complete disk statistics: {outputs:#?}"
+    );
+    let cache_publishers = outputs
+        .iter()
+        .filter(|output| summary_field(output, "cache_logical_added").is_some_and(|bytes| bytes > 0))
+        .count();
+    assert_eq!(
+        cache_publishers, 1,
+        "the atomic CAS publication must be charged to exactly one concurrent build: {outputs:#?}"
     );
 
     // Cache readers use separate target directories, so all eight roots still

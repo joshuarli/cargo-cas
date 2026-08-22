@@ -71,7 +71,14 @@ fn main() {
 fn setup_logger() -> Option<tracing_chrome::FlushGuard> {
     use tracing_subscriber::prelude::*;
 
-    let env = tracing_subscriber::EnvFilter::from_env("CARGO_LOG");
+    let env = if std::env::var_os("CARGO_LOG").is_none() {
+        tracing_subscriber::EnvFilter::builder()
+            .with_default_directive(tracing_subscriber::filter::LevelFilter::ERROR.into())
+            .with_env_var("CARGO_LOG")
+            .parse_lossy("cargo::compiler::cas=info")
+    } else {
+        tracing_subscriber::EnvFilter::from_env("CARGO_LOG")
+    };
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_timer(tracing_subscriber::fmt::time::Uptime::default())
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
